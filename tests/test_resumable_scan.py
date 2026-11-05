@@ -35,7 +35,14 @@ class ResumableScanTests(unittest.TestCase):
             def __init__(self, unused_root, allow_network=False):
                 assert allow_network
                 self.local = local_type(outer.root)
-                self.root, self.identity = self.local.root, self.local.identity
+                self.root = self.local.root
+                # This fixture observes files/directories via Python stat,
+                # whose Windows identity representation can differ from the
+                # local guard's native handle identity on newer Python.
+                # Keep the synthetic binding in that same stat domain; the
+                # real local guard retains and checks its own native identity.
+                root_info = self.root.lstat()
+                self.identity = (root_info.st_dev, root_info.st_ino)
                 self.target = outer.mapping
 
             def check_root(self):

@@ -56,6 +56,11 @@ jobs:
         run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_graph_auth.py -v
         env:
           PYTHONPATH: python
+      - name: Verify resumable scan fixtures before full Windows regression
+        if: runner.os == 'Windows'
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_resumable_scan.py -v
+        env:
+          PYTHONPATH: python
       - run: npm run test:installer
       - run: npm run test:doctor
       - run: npm run test:cloud-configure
