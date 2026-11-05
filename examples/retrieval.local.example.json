@@ -1,0 +1,23 @@
+{
+  "candidate_limit": 100,
+  "rrf_k": 60,
+  "semantic": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:8000/v1/embeddings",
+    "model": "replace-with-local-embedding-model",
+    "model_revision": "replace-with-immutable-model-revision",
+    "timeout_seconds": 10,
+    "batch_size": 16,
+    "max_segments": 20000,
+    "max_text_chars": 8000,
+    "minimum_similarity": 0.0,
+    "per_file_budget_seconds": 20
+  },
+  "rerank": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:8001/rerank",
+    "model": "replace-with-local-rerank-model",
+    "timeout_seconds": 10,
+    "max_candidates": 30
+  }
+}

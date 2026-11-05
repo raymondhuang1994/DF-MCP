@@ -1,0 +1,4 @@
+kol_id,channel,quote_cny,valid_until,qualification
+KOL-X,video,8000.00,2026-12-31,verified_sample
+KOL-Y,social,6000.00,2026-10-15,expired_at_evaluation
+KOL-Z,video,,2026-12-31,quote_missing

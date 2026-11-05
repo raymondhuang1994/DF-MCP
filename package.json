@@ -1,0 +1,44 @@
+{
+  "name": "df-mcp",
+  "version": "0.7.0",
+  "description": "Local-first, evidence-aware team document reader with MCP tools and an agent skill",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "demo": "node dist/index.js --config examples/config.sample.json",
+    "setup": "node scripts/setup.mjs",
+    "configure": "node scripts/configure.mjs",
+    "test": "node scripts/test.mjs",
+    "test:installer": "node --test --test-timeout=60000 tests/installer.test.mjs",
+    "test:mcp": "node scripts/mcp-smoke.mjs",
+    "test:backend": "node --test --test-timeout=30000 tests/backend.test.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "test:doctor": "node --test --test-timeout=30000 tests/doctor.test.mjs",
+    "test:concurrency": "node scripts/mcp-concurrency.mjs",
+    "maintain:state": "node scripts/maintain-state.mjs",
+    "check:public": "node scripts/check-public.mjs",
+    "install:skill": "node scripts/install-skill.mjs",
+    "test:install": "node scripts/install-smoke.mjs",
+    "evaluate": "node scripts/evaluate.mjs",
+    "configure:cloud": "node scripts/configure-cloud.mjs",
+    "login:cloud": "node scripts/login-cloud.mjs",
+    "test:cloud-configure": "node --test --test-timeout=30000 tests/cloud-configure.test.mjs",
+    "test:cloud": "node scripts/mcp-cloud-smoke.mjs",
+    "build:skill": "python scripts/build-skill.py"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "df mcp"
+  short_description: "团队公盘与本地资料助手：两步选择、独立索引、有据回答"
+  default_prompt: "使用 $df-mcp 初始化资料助手，或从已配置的资料库查找证据，引用来源、位置和版本。"
+policy:
+  allow_implicit_invocation: true

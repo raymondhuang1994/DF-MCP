@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "purpose": "Synthetic metric definitions for downstream deterministic implementations; not executable configuration for this MCP engine.",
+  "is_demo": true,
+  "metrics": [
+    {
+      "metric_id": "remaining_budget",
+      "definition": "approved_budget - actual_spend - committed_not_in_actual",
+      "required_dimensions": ["project_id", "period", "currency", "tax_basis"],
+      "calculation_type": "exact_decimal",
+      "missing_value_policy": "unknown_not_zero",
+      "duplicate_policy": "Reject duplicate business keys unless an approved revision rule resolves them.",
+      "commitment_policy": "Exclude commitments already represented by actual spend.",
+      "source_requirement": "All included inputs must be approved for the requested scope; partial evidence permits only a labelled subtotal."
+    },
+    {
+      "metric_id": "historical_cost_per_conversion",
+      "definition": "sum(eligible_spend) / sum(eligible_conversions)",
+      "required_dimensions": ["project_id", "kol_id", "currency", "observation_window", "conversion_definition"],
+      "zero_denominator_policy": "undefined",
+      "missing_value_policy": "unknown_not_zero",
+      "aggregation_policy": "Aggregate numerators and denominators; do not average per-record ratios.",
+      "interpretation_limit": "Historical association only; no causal or future-performance claim."
+    }
+  ]
+}

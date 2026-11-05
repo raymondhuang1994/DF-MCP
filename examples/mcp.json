@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "df_mcp": {
+      "command": "<absolute-node-executable-from-installer>",
+      "args": ["<absolute-repository-path>/dist/index.js", "--config", "<configuration-path-from-installer>", "--python", "<absolute-venv-python-executable-from-installer>"]
+    }
+  }
+}

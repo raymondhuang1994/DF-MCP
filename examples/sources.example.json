@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "purpose": "Synthetic reference for a business workflow; not automatically consumed by the local MCP engine.",
+  "is_demo": true,
+  "sources": [
+    {
+      "source_id": "DEMO-BUDGET-APPROVED",
+      "relative_path": "budgets/approved-budget.csv",
+      "topic": "campaign_budget",
+      "project_id": "DEMO-001",
+      "status": "approved",
+      "period": "2030-01",
+      "maintainer_role": "budget_owner",
+      "authority_rule": "Only an explicitly approved source for the requested period is authoritative; modification time is insufficient.",
+      "deduplication_key": ["project_id", "period", "platform", "currency"],
+      "replaces_source_ids": []
+    },
+    {
+      "source_id": "DEMO-KOL-HISTORY",
+      "relative_path": "kol/history.csv",
+      "topic": "kol_historical_performance",
+      "project_id": "DEMO-001",
+      "status": "reference",
+      "period": "2030-01",
+      "maintainer_role": "campaign_analyst",
+      "authority_rule": "Historical metrics require a verified observation window and source definition; they do not predict future results.",
+      "deduplication_key": ["record_id"],
+      "replaces_source_ids": []
+    }
+  ],
+  "notes": [
+    "Paths and records are illustrative and need not exist in the sample corpus.",
+    "A real registry belongs outside the public repository and must be reviewed by the relevant business owner."
+  ]
+}

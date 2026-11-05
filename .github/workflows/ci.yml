@@ -1,0 +1,101 @@
+name: validate
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.9 binaries are unavailable on the latest Ubuntu image.
+          - os: ubuntu-22.04
+            python: '3.9'
+          - os: ubuntu-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.9'
+          - os: windows-latest
+            python: '3.13'
+          - os: macos-latest
+            python: '3.9'
+          - os: macos-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - run: npm ci --ignore-scripts
+      - run: npm run setup -- --skip-config
+        env:
+          DF_MCP_PYTHON: ${{ steps.python.outputs.python-path }}
+      - name: Verify native Windows share before full regression
+        if: runner.os == 'Windows'
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_network_source.py -v
+        env:
+          PYTHONPATH: python
+          DF_MCP_TEST_SMB: '1'
+      - name: Verify Windows credential publication before full regression
+        if: runner.os == 'Windows'
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -p test_graph_auth.py -v
+        env:
+          PYTHONPATH: python
+      - run: npm run test:installer
+      - run: npm run test:doctor
+      - run: npm run test:cloud-configure
+      - run: npm run test:backend
+      - run: npm test
+        env:
+          DF_MCP_TEST_SMB: ${{ runner.os == 'Windows' && '1' || '0' }}
+      - run: npm run evaluate -- --output .local/evaluation-ci.json
+      - run: npm run test:mcp
+      - run: npm run test:cloud
+      - run: node scripts/mcp-concurrency.mjs
+      - run: npm run test:install
+      - run: npm run check:public
+  release:
+    name: Package validated Skill
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'raymondhuang1994/DF-MCP'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - name: Build root-level SKILL.md archive and checksum
+        run: |
+          python scripts/package-release.py --output-dir .build/release
+      - name: Publish a new version after all six validation jobs pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          RELEASE_VERSION="$(python -c 'import json; print(json.load(open("package.json"))["version"])')"
+          RELEASE_TAG="v${RELEASE_VERSION}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; immutable packages are not overwritten."
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" .build/release/* \
+            --target "$GITHUB_SHA" --title "DF-MCP $RELEASE_TAG" \
+            --notes-file docs/release-notes.md

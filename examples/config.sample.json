@@ -1,0 +1,16 @@
+{
+  "provider": "local",
+  "root": "sample-drive",
+  "state_dir": "../.local/sample-v02-state",
+  "poll_seconds": 30,
+  "limits": {
+    "max_file_bytes": 268435456,
+    "max_uncompressed_bytes": 536870912,
+    "max_segments": 100000,
+    "max_segment_chars": 8000,
+    "max_columns": 512,
+    "max_pdf_pages": 2000,
+    "parse_timeout_seconds": 30
+  },
+  "aliases": { "花费": ["支出"], "达人": ["KOL"], "剩余": ["可用"] }
+}

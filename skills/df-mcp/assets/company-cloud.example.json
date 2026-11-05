@@ -1,0 +1,8 @@
+{
+  "description": "IT填写并批准后使用；本文件不包含凭证，也不会自动授权。",
+  "tenant_id": "<公司批准的租户ID>",
+  "client_id": "<公司批准的公共客户端应用ID>",
+  "scopes": ["Files.Read"],
+  "known_sites": [],
+  "known_drives": []
+}

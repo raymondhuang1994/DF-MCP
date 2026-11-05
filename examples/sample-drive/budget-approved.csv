@@ -1,0 +1,4 @@
+project_id,project_name,period,currency,approved_budget,actual_spend,committed_only,status
+P-001,星河计划,2026-09,CNY,100000.00,40000.25,12000.00,approved
+P-002,晨光计划,2026-09,CNY,50000.00,21000.10,5000.00,approved
+P-003,远山计划,2026-09,CNY,30000.00,32000.00,0.00,approved

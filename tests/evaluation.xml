@@ -1,0 +1,12 @@
+<evaluation>
+  <qa_pair><question>在模拟资料中找到星河计划 2026-09 的正式批准预算；排除草稿，按两位小数输出。</question><answer>100000.00</answer></qa_pair>
+  <qa_pair><question>依据正式预算和 terms 的可用金额口径，星河计划尚可用多少 CNY？输出两位小数。</question><answer>47999.75</answer></qa_pair>
+  <qa_pair><question>依据正式预算，2026-09 全部项目实际支出合计多少 CNY？必须完整读取所有记录，输出两位小数。</question><answer>93000.35</answer></qa_pair>
+  <qa_pair><question>依据正式预算和口径文件，全部项目可用预算合计多少 CNY？输出两位小数。</question><answer>69999.65</answer></qa_pair>
+  <qa_pair><question>按正式预算与可用口径，哪个项目的可用预算为负？输出项目 ID。</question><answer>P-003</answer></qa_pair>
+  <qa_pair><question>找到模拟 KOL-X 的付款条款，验收通过后多少天内支付尾款？只输出天数。</question><answer>30</answer></qa_pair>
+  <qa_pair><question>以 2026-10-23 为固定评估日，哪位模拟 KOL 的已提供报价已经过期？输出 KOL ID。</question><answer>KOL-Y</answer></qa_pair>
+  <qa_pair><question>核对模拟 KOL 表，哪位候选者没有提供报价，不能把其报价当作零？输出 KOL ID。</question><answer>KOL-Z</answer></qa_pair>
+  <qa_pair><question>完整定位长文的最终归档条款，输出校验代码。</question><answer>ARCHIVE-END-742</answer></qa_pair>
+  <qa_pair><question>结合来源说明和正式预算，输出 P-001 的项目名称、币种、账期，用竖线连接。</question><answer>星河计划|CNY|2026-09</answer></qa_pair>
+</evaluation>
