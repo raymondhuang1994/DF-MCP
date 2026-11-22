@@ -44,10 +44,10 @@ class PackagedSkillTests(unittest.TestCase):
                 return json.loads(response.stdout)
             # No system-installed parsing dependency is visible with -S.
             check = subprocess.run([sys.executable, "-S", "-c",
-                                    "import sys;sys.path.insert(0,sys.argv[1]);from _df_runtime import bootstrap;bootstrap();import pypdf,defusedxml;print(pypdf.__version__)",
+                                    "import sys,json;sys.path.insert(0,sys.argv[1]);from _df_runtime import bootstrap;bootstrap();import pypdf,defusedxml,team_drive;print(json.dumps([pypdf.__version__,team_drive.__version__]))",
                                     str(skill / "scripts")], capture_output=True, text=True, env=env, cwd=base, timeout=20)
             self.assertEqual(check.returncode, 0, check.stderr)
-            self.assertEqual(check.stdout.strip(), "6.21.2")
+            self.assertEqual(json.loads(check.stdout), ["6.21.2", manifest["version"]])
             source = base / "SIMULATED source"
             source.mkdir()
             (source / "budget.txt").write_text("SIMULATED budget 123\n", encoding="utf-8")
@@ -59,7 +59,11 @@ class PackagedSkillTests(unittest.TestCase):
             applied = run("df-init.py", "apply", "--plan", str(plan_path), "--confirmed")
             config_path = Path(applied["config_path"])
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["service"] = {"idle_seconds": 1}
+            # Each packaged CLI is a cold Python process; startup can exceed a
+            # one-second lease on Windows. Keep the reuse assertion below,
+            # allowing the broker to survive the gap between these clients.
+            idle_seconds = 15
+            config["service"] = {"idle_seconds": idle_seconds}
             config_path.write_text(json.dumps(config), encoding="utf-8")
             first = second = None
             try:
@@ -109,7 +113,7 @@ class PackagedSkillTests(unittest.TestCase):
                 self.assertFalse(list(skill.rglob("*.sqlite*")))
             finally:
                 endpoint = Path(config["state_dir"]) / "shared-v1" / "control" / "endpoint.json"
-                deadline = time.monotonic() + 8
+                deadline = time.monotonic() + idle_seconds + 8
                 while endpoint.exists() and time.monotonic() < deadline:
                     time.sleep(.1)
                 self.assertFalse(endpoint.exists(), "test broker should finish its idle shutdown")

@@ -1,5 +1,8 @@
 """Generated public fixtures exercise parsing boundaries and evidence fidelity."""
 import json
+import contextlib
+import errno
+import io
 import os
 import sqlite3
 import subprocess
@@ -152,6 +155,62 @@ class ExtractTests(unittest.TestCase):
         results = list(iter_segments(path, {"max_segment_chars": 256}))
         self.assertEqual(value, "".join(c["value"] for s in results for c in s["data"]["cells"] if c["coordinate"] == "A1"))
         self.assertEqual(99, results[-1]["locator"]["row"])
+
+    def test_empty_shared_string_cells_preserve_none_and_valid_references(self):
+        path = self.xlsx('<row r="1"><c r="A1" t="s"/><c r="B1" t="s"><v/></c><c r="C1" t="s"><v>0</v></c></row>',
+                         shared='<si><t>SIMULATED value</t></si>')
+        cells = list(iter_segments(path, {}))[0]["data"]["cells"]
+        self.assertEqual([c["coordinate"] for c in cells], ["A1", "B1", "C1"])
+        self.assertEqual([c["value"] for c in cells], [None, None, "SIMULATED value"])
+        path = self.xlsx('<row r="1"><c r="A1" t="s"/></row>')
+        self.assertIsNone(list(iter_segments(path, {}))[0]["data"]["cells"][0]["value"])
+
+    def test_nonempty_invalid_shared_string_references_still_fail(self):
+        for reference in ("-1", "1", "999", "not-an-index"):
+            with self.subTest(reference=reference):
+                path = self.xlsx(f'<row r="1"><c r="A1" t="s"><v>{reference}</v></c></row>', shared='<si><t>SIMULATED</t></si>')
+                self.assertCode("parse_failed", path)
+
+    def test_shared_string_scratch_directory_failure_is_runtime(self):
+        path = self.xlsx('<row r="1"><c r="A1" t="s"><v>0</v></c></row>', shared='<si><t>SIMULATED</t></si>')
+        with mock.patch("team_drive.extract.tempfile.TemporaryDirectory", side_effect=OSError(errno.ENOSPC, "SIMULATED disk full")):
+            self.assertCode("STATE_IO_ERROR", path)
+
+    def test_shared_string_sqlite_connect_failure_is_runtime(self):
+        path = self.xlsx('<row r="1"><c r="A1" t="s"><v>0</v></c></row>', shared='<si><t>SIMULATED</t></si>')
+        with mock.patch("team_drive.extract.sqlite3.connect", side_effect=sqlite3.OperationalError("SIMULATED database unavailable")):
+            self.assertCode("STATE_IO_ERROR", path)
+
+    def test_shared_string_sqlite_write_failure_is_runtime(self):
+        real_connect = sqlite3.connect
+        class FailingDatabase:
+            def __init__(self, value):
+                self.value = value
+            def execute(self, sql, *args):
+                if sql.startswith("INSERT"):
+                    raise sqlite3.OperationalError("SIMULATED database full")
+                return self.value.execute(sql, *args)
+            def __getattr__(self, name):
+                return getattr(self.value, name)
+        path = self.xlsx('<row r="1"><c r="A1" t="s"><v>0</v></c></row>', shared='<si><t>SIMULATED</t></si>')
+        with mock.patch("team_drive.extract.sqlite3.connect", side_effect=lambda *args, **kwargs: FailingDatabase(real_connect(*args, **kwargs))):
+            self.assertCode("STATE_IO_ERROR", path)
+
+    def test_parser_protocol_preserves_private_scratch_failure(self):
+        from team_drive.extract import main
+        path = self.xlsx('<row r="1"><c r="A1" t="s"><v>0</v></c></row>', shared='<si><t>SIMULATED</t></si>')
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["extract", str(path), "{}"]), \
+                mock.patch("team_drive.extract.tempfile.TemporaryDirectory", side_effect=OSError(errno.ENOSPC, "SIMULATED full disk")), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(main(), 1)
+        self.assertEqual(json.loads(output.getvalue())["error"]["code"], "STATE_IO_ERROR")
+
+    def test_malformed_zip_is_not_reported_as_private_scratch_failure(self):
+        path = self.file("bad.xlsx", "SIMULATED not a ZIP")
+        with mock.patch("team_drive.extract.tempfile.TemporaryDirectory") as temporary:
+            self.assertCode("parse_failed", path)
+        temporary.assert_not_called()
 
     def test_xlsx_merge_context_expires_and_phonetic_text_not_duplicated(self):
         path = self.xlsx('<row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>',

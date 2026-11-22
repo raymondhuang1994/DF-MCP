@@ -12,6 +12,21 @@ from team_drive.errors import DriveError
 
 
 class BrokerLifecycleTests(unittest.TestCase):
+    def test_changed_selected_configuration_cannot_initialize_source_or_state(self):
+        config = {"config_id": "b" * 64, "config_fingerprint": "c" * 64}
+        for expected in ({"expected_config_id": "a" * 64}, {"expected_config_fingerprint": "a" * 64}):
+            with self.subTest(expected=expected), \
+                    mock.patch("team_drive.broker.settings", return_value=config), \
+                    mock.patch("team_drive.broker.SourceAccess") as source, \
+                    mock.patch("team_drive.broker.StateAccess") as state, \
+                    mock.patch("team_drive.broker.Engine") as engine:
+                with self.assertRaises(DriveError) as caught:
+                    Broker("synthetic-config.json", **expected)
+                self.assertEqual(caught.exception.code, "CONFIG_CHANGED")
+                source.assert_not_called()
+                state.assert_not_called()
+                engine.assert_not_called()
+
     def test_other_windows_user_is_rejected_before_config_or_tools(self):
         broker = Broker.__new__(Broker)
         broker.token = "synthetic-credential"
@@ -33,6 +48,7 @@ class BrokerLifecycleTests(unittest.TestCase):
         broker.clients_lock = threading.Lock()
         broker.connections = set()
         broker.config = {"idle_seconds": 1}
+        broker.engine = None
         broker.last_empty = 0
         broker.stop_event = mock.Mock()
         broker.stop_event.wait.return_value = False
@@ -69,7 +85,7 @@ class BridgeStartupTests(unittest.TestCase):
     def environment(self, metadata):
         bridge = Bridge.__new__(Bridge)
         bridge.config = {"root": Path("/source"), "base": Path("/state"), "path": Path("/config.json"),
-                         "config_id": "config", "code_id": "code"}
+                         "config_id": "config", "config_fingerprint": "fingerprint", "code_id": "code"}
         clock = SimpleNamespace(now=0.0)
         processes = []
         spawn_times = []
@@ -89,6 +105,7 @@ class BridgeStartupTests(unittest.TestCase):
 
         fake_time = SimpleNamespace(time=lambda: 1000, monotonic=lambda: clock.now, sleep=sleep)
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch("team_drive.bridge.settings", return_value=bridge.config))
             stack.enter_context(mock.patch("team_drive.bridge.SourceAccess"))
             stack.enter_context(mock.patch("team_drive.bridge.StateAccess", return_value=storage))
             stack.enter_context(mock.patch("team_drive.bridge.validate_state_boundaries", return_value=Path("/state")))
@@ -130,6 +147,15 @@ class BridgeStartupTests(unittest.TestCase):
             with self.assertRaises(DriveError) as caught:
                 bridge.connect()
             self.assertEqual(caught.exception.code, "UNSAFE_STATE")
+            self.assertEqual(len(processes), 1)
+
+    def test_configuration_change_before_respawn_is_rejected(self):
+        with self.environment(lambda name, processes: None) as (bridge, processes, times, clock, receive):
+            changed = {**bridge.config, "config_fingerprint": "changed"}
+            with mock.patch("team_drive.bridge.settings", return_value=changed):
+                with self.assertRaises(DriveError) as caught:
+                    bridge.connect()
+            self.assertEqual(caught.exception.code, "CONFIG_CHANGED")
             self.assertEqual(len(processes), 1)
 
     def test_configuration_conflict_does_not_spawn_or_retry(self):

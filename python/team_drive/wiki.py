@@ -99,7 +99,7 @@ class WikiStore:
         consequently incomplete inventory never becomes deletion evidence here.
         No source text or title is returned by this database-only hook.
         """
-        rows = db.execute("SELECT DISTINCT p.page_id FROM wiki_pages p JOIN wiki_dependencies d ON d.page_id=p.page_id LEFT JOIN files f ON f.id=d.file_id WHERE p.state='current' AND (f.id IS NULL OR f.status!='ready' OR f.source_version IS NULL OR f.source_version!=d.source_version)").fetchall()
+        rows = db.execute("SELECT DISTINCT p.page_id FROM wiki_pages p JOIN wiki_dependencies d ON d.page_id=p.page_id LEFT JOIN files f ON f.id=d.file_id WHERE p.state='current' AND (f.id IS NULL OR f.status!='ready' OR f.needs_reparse=1 OR f.source_version IS NULL OR f.source_version!=d.source_version)").fetchall()
         for row in rows:
             db.execute("UPDATE wiki_pages SET state='stale',reason='SOURCE_INDEX_CHANGED' WHERE page_id=?", (row[0],))
             WikiStore._event(db, row[0], "invalidated", "SOURCE_INDEX_CHANGED")
@@ -180,8 +180,8 @@ class WikiStore:
                 context["files"][key] = self.engine._validated(*key)
                 self._budget(context)
             with self.engine._db() as db:
-                row = db.execute("SELECT status,source_version FROM files WHERE id=?", (key[0],)).fetchone()
-                if not row or row["status"] != "ready" or row["source_version"] != key[1]:
+                row = db.execute("SELECT status,source_version,needs_reparse FROM files WHERE id=?", (key[0],)).fetchone()
+                if not row or row["status"] != "ready" or row["needs_reparse"] or row["source_version"] != key[1]:
                     raise DriveError("INDEX_CHANGED", "The source index changed during Wiki verification.", True, "Inspect the source and rebuild the affected page.")
                 segment = db.execute("SELECT payload FROM segments WHERE file_id=? AND source_version=? AND ordinal=?", (*key, citation["ordinal"])).fetchone()
             if segment is None:
@@ -329,8 +329,8 @@ class WikiStore:
                                  "Read the page or its queued revision, then supply that expected_revision.")
             # Index changes may race verification while a background scan runs.
             for citation in citations:
-                source = db.execute("SELECT status,source_version FROM files WHERE id=?", (citation["file_id"],)).fetchone()
-                if not source or source["status"] != "ready" or source["source_version"] != citation["source_version"]:
+                source = db.execute("SELECT status,source_version,needs_reparse FROM files WHERE id=?", (citation["file_id"],)).fetchone()
+                if not source or source["status"] != "ready" or source["needs_reparse"] or source["source_version"] != citation["source_version"]:
                     raise DriveError("INDEX_CHANGED", "A source changed before the Wiki page could be published.", True, "Read current source evidence and retry.")
             revision = current_revision + 1
             db.execute("INSERT INTO wiki_pages(page_id,kind,title,body,citations,links,revision,state,reason,created_at,updated_at,verified_at) VALUES(?,?,?,?,?,?,?,'current',NULL,?,?,?) ON CONFLICT(page_id) DO UPDATE SET kind=excluded.kind,title=excluded.title,body=excluded.body,citations=excluded.citations,links=excluded.links,revision=excluded.revision,state='current',reason=NULL,updated_at=excluded.updated_at,verified_at=excluded.verified_at", (page_id, kind, title, body, _json(citations), _json(links), revision, old["created_at"] if old else now, now, now))
@@ -372,8 +372,8 @@ class WikiStore:
                         if not current or current["revision"] != row["revision"] or current["state"] != "stale":
                             raise DriveError("WIKI_PAGE_CHANGED", "The queued Wiki page changed during revalidation.", True, "Refresh the current page again.")
                         for citation in json.loads(row["citations"]):
-                            source = db.execute("SELECT status,source_version FROM files WHERE id=?", (citation["file_id"],)).fetchone()
-                            if not source or source["status"] != "ready" or source["source_version"] != citation["source_version"]:
+                            source = db.execute("SELECT status,source_version,needs_reparse FROM files WHERE id=?", (citation["file_id"],)).fetchone()
+                            if not source or source["status"] != "ready" or source["needs_reparse"] or source["source_version"] != citation["source_version"]:
                                 raise DriveError("INDEX_CHANGED", "A source changed during Wiki revalidation.", True, "Refresh the current source index.")
                         db.execute("UPDATE wiki_pages SET state='current',reason=NULL,verified_at=? WHERE page_id=?", (time.time(), row["page_id"]))
                         self._event(db, row["page_id"], "revalidated")

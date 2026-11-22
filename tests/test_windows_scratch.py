@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from team_drive.fs_access import SourceAccess, StateAccess
+from team_drive.fs_access import SourceAccess, StateAccess, private_io_path
 
 
 class ScratchMetadataTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class ScratchMetadataTests(unittest.TestCase):
 
         @contextlib.contextmanager
         def scandir(path):
-            if Path(path) == self.scratch:
+            if Path(path) == Path(private_io_path(self.scratch)):
                 yield iter([entry])
             else:
                 with original_scandir(path) as entries:

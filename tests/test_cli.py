@@ -64,7 +64,8 @@ class CliTests(unittest.TestCase):
 
     def test_permission_failure_discards_preceding_pages(self):
         bridge = mock.Mock()
-        bridge.call.side_effect = [{"ok": True, "files": [{"name": "private"}], "next_cursor": "next"},
+        bridge.call.side_effect = [{"ok": True, "current_job_id": None},
+                                  {"ok": True, "files": [{"name": "private"}], "next_cursor": "next"},
                                    {"ok": False, "error": {"code": "ACCESS_DENIED"}}]
         result = collect(bridge, "list", {})
         self.assertFalse(result["ok"])

@@ -1,5 +1,7 @@
 # DF-MCP
 
+0.8 adds an offline source catalog, configuration-pinned profile selection and an optional source-bound CLI evidence envelope for router/advisor workflows. It also carries Windows long-path recovery, bounded scan lifetime, transient-failure cache protection and extraction-version invalidation without deleting the published candidate index. See [source selection and evidence handoff](skills/df-mcp/references/integration.md). Original document access remains read-only; business correctness and production whole-drive coverage require separate acceptance.
+
 [![Windows, macOS and Linux validation](https://github.com/raymondhuang1994/DF-MCP/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raymondhuang1994/DF-MCP/actions/workflows/ci.yml)
 
 给 AI 使用的团队文件读取工具，支持普通本地目录、显式配置的 Windows 网络公盘，以及 OneDrive/SharePoint 云盘文件夹。本仓库为独立的 **DF-MCP** 项目，Skill 名称和工具前缀沿用 `df-mcp`、`team_drive_`。架构：**Skill + Python 工具入口 / 本机 MCP + SQLite 增量索引 + 本地 Wiki**。优先保证来源、版本和读取范围可核查，再优化定位速度。所有附带业务数据均为 **SIMULATED / 完全虚构**。
@@ -236,7 +238,7 @@ npm run test:install
 
 CI 在 Windows、macOS、Linux 的清洁检出中安装依赖并构建，覆盖 Python 3.9 与 3.13。`test:install` 另外使用临时用户目录运行真实配置、Skill 安装和诊断命令，再启动两份 MCP 客户端检查同文件读取、共享实例、关闭重开与来源不变。它验证默认路径与安装流程；不能代替每台电脑的企业策略、源 ACL 或 Codex 应用级验收。
 
-新安装的最小验收：在两条聊天各自调用 status，确认版本为 0.7.0、`state_storage.mode=shared`、同一个 `instance_id` 和预期 provider，发现原有证据工具与新增 Wiki 工具，再 inspect/read 同一文件，并用 context 核对返回的原文位置与缺口。按 [0.7 验收](docs/UPGRADE_0_7.md) 验证扫描续跑、Wiki 来源校验与增量失效。完整退出并重开 Codex 后重复一次。云来源还需验证登录、权限、更新/删除和断网；目前没有真实租户验收结果。失败时保留结构化错误，用明确配置运行 doctor；不要创建随机状态目录或删除活动锁文件作为修复。
+新安装的最小验收：在两条聊天各自调用 status，确认版本为 0.8.0、`state_storage.mode=shared`、同一个 `instance_id` 和预期 provider，发现原有证据工具与新增 Wiki 工具，再 inspect/read 同一文件，并用 context 核对返回的原文位置与缺口。按 [0.7 验收](docs/UPGRADE_0_7.md) 验证扫描续跑、Wiki 来源校验与增量失效。完整退出并重开 Codex 后重复一次。云来源还需验证登录、权限、更新/删除和断网；目前没有真实租户验收结果。失败时保留结构化错误，用明确配置运行 doctor；不要创建随机状态目录或删除活动锁文件作为修复。
 
 `npm run demo` 显式启动模拟目录的 stdio 服务；它不提供聊天界面，需 MCP 客户端发送协议请求。也可将客户端 `--config` 指向仓库 `examples/config.sample.json`，用 `$df-mcp` 查询样本。演示配置使用独立的 `.local/sample-v02-state/`，不会自动替换你的正式配置或复用 0.1 旧演示缓存。
 

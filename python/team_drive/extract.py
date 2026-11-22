@@ -15,12 +15,14 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
 from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
+from .fs_access import private_io_path
+from .errors import DriveError
 
 SUPPORTED_SUFFIXES = frozenset({".txt", ".md", ".csv", ".tsv", ".xlsx", ".docx", ".pptx", ".pdf"})
 DEFAULT_LIMITS = {
@@ -47,6 +49,63 @@ class ExtractionError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _scratch_error(exc, operation, path):
+    return ExtractionError(
+        "STATE_IO_ERROR",
+        "Private parser scratch I/O failed (operation=%s; errno=%s; winerror=%s; sqlite_code=%s; path_chars=%s)." %
+        (operation, getattr(exc, "errno", None), getattr(exc, "winerror", None),
+         getattr(exc, "sqlite_errorcode", None), len(str(path))))
+
+class _ScratchSQLite:
+    """Wrap only calls on our private shared-string database and its cursors."""
+    def __init__(self, value, path):
+        self._value, self._path = value, path
+
+    def __getattr__(self, name):
+        value = getattr(self._value, name)
+        if not callable(value):
+            return value
+        def call(*args, **kwargs):
+            try:
+                result = value(*args, **kwargs)
+            except (sqlite3.Error, OSError) as exc:
+                raise _scratch_error(exc, "sqlite_" + name, self._path) from None
+            return _ScratchSQLite(result, self._path) if isinstance(result, sqlite3.Cursor) else result
+        return call
+
+@contextmanager
+def _shared_strings(path):
+    """Keep scratch failures distinct from malformed workbook/ZIP failures."""
+    temp, connection, primary = None, None, False
+    scratch_path = path.parent
+    try:
+        try:
+            temp = tempfile.TemporaryDirectory(prefix="team-drive-strings-", dir=private_io_path(path.parent))
+        except OSError as exc:
+            raise _scratch_error(exc, "directory_create", scratch_path) from None
+        scratch_path = Path(temp.name) / "strings.sqlite"
+        try:
+            connection = sqlite3.connect(private_io_path(scratch_path))
+        except (sqlite3.Error, OSError) as exc:
+            raise _scratch_error(exc, "sqlite_connect", scratch_path) from None
+        strings = _ScratchSQLite(connection, scratch_path)
+        yield strings
+        strings.commit()
+    except BaseException:
+        primary = True
+        raise
+    finally:
+        secondary = None
+        for value, method in ((connection, "close"), (temp, "cleanup")):
+            if value is not None:
+                try:
+                    getattr(value, method)()
+                except (sqlite3.Error, OSError) as exc:
+                    secondary = secondary or _scratch_error(exc, "scratch_" + method, scratch_path)
+        if secondary is not None and not primary:
+            raise secondary
 
 
 def _limits(given: Dict[str, Any]) -> Dict[str, int]:
@@ -259,12 +318,14 @@ def _csv(path, limits):
 
 
 def _xlsx(path, limits):
-    with _Archive(path, limits) as arc, tempfile.TemporaryDirectory(prefix="team-drive-strings-") as temp:
+    # The caller provides a verified private snapshot. Keep parser scratch beside
+    # it explicitly; a failed TEMP candidate must not fall back outside state.
+    with _Archive(path, limits) as arc:
         # A disk-backed shared-string lookup avoids a Python list proportional to
         # every string in a large workbook. Temporary data is deleted on exit.
         # sqlite3's connection context manages transactions, not the connection
         # lifetime. Close before TemporaryDirectory cleanup (required on Windows).
-        with closing(sqlite3.connect(str(Path(temp) / "strings.sqlite"))) as strings, strings:
+        with _shared_strings(path) as strings:
             strings.execute("CREATE TABLE strings (id INTEGER PRIMARY KEY, text TEXT NOT NULL)")
             if "xl/sharedStrings.xml" in arc.names:
                 counter = 0
@@ -352,10 +413,16 @@ def _xlsx(path, limits):
                         raw = node.findtext("s:v", None, NS)
                         value = raw
                         if raw_type == "s":
-                            found = strings.execute("SELECT text FROM strings WHERE id = ?", (int(raw or "-1"),)).fetchone()
-                            if found is None:
-                                raise ExtractionError("parse_failed", "A shared string reference cannot be resolved.")
-                            value = found[0]
+                            # Styled/cleared shared-string cells may omit <v> or
+                            # contain an empty <v/>. Preserve a missing value;
+                            # only actual references must resolve in the table.
+                            if raw is None or raw == "":
+                                value = None
+                            else:
+                                found = strings.execute("SELECT text FROM strings WHERE id = ?", (int(raw),)).fetchone()
+                                if found is None:
+                                    raise ExtractionError("parse_failed", "A shared string reference cannot be resolved.")
+                                value = found[0]
                         elif raw_type == "inlineStr":
                             value = _spreadsheet_text(node.find("s:is", NS))
                         cell = {"coordinate": coordinate, "value": value,
@@ -560,7 +627,7 @@ def _pdf(path, limits):
 
 def iter_segments(path: Path, limits: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     """Yield bounded segments; a later exception means the extraction is partial."""
-    path = Path(path)
+    path = Path(private_io_path(path))
     config = _limits(limits)
     try:
         if path.suffix.lower() not in SUPPORTED_SUFFIXES:
@@ -578,6 +645,8 @@ def iter_segments(path: Path, limits: Dict[str, Any]) -> Iterator[Dict[str, Any]
                 yield segment
     except ExtractionError:
         raise
+    except DriveError as exc:
+        raise ExtractionError(exc.code, exc.message) from None
     except UnicodeDecodeError:
         raise ExtractionError("unsupported_encoding", "Text must use UTF-8 encoding; convert the file explicitly before retrying.") from None
     except DefusedXmlException:

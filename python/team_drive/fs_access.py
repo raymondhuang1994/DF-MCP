@@ -26,6 +26,76 @@ DATABASE_NAMES = ("index.sqlite", "index.working.sqlite", "index.next.sqlite", "
 DATABASE_FILES = tuple(name + suffix for name in DATABASE_NAMES for suffix in ("", "-wal", "-shm", "-journal"))
 
 
+def private_io_path(path):
+    """Adapt an already boundary-checked private path for Windows I/O.
+
+    This is spelling conversion, not source/state authorization. Callers retain
+    ordinary paths for identity and boundary checks. Never enable long paths by
+    changing machine policy or accepting UNC/device paths as private storage.
+    """
+    value = os.fspath(path)
+    if os.name != "nt":
+        return value
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    if not re.match(r"^[A-Za-z]:\\", value):
+        raise DriveError("UNSAFE_STATE", "Private I/O requires an absolute fixed-local path.")
+    # Recheck components before adding the extended prefix, whose Win32 spelling
+    # intentionally disables ordinary path normalization.
+    for part in Path(value).parts[1:]:
+        _windows_component(part)
+    return _extended(_valid_windows_path(value))
+
+def _private_io_error(exc, operation, path):
+    """Keep actionable OS diagnostics without paths or source contents."""
+    return DriveError(
+        "STATE_IO_ERROR",
+        "Private storage I/O failed (operation=%s; errno=%s; winerror=%s; path_chars=%s)." %
+        (operation, getattr(exc, "errno", None), getattr(exc, "winerror", None), len(os.fspath(path))),
+        False, "Resolve private storage access before explicitly retrying the existing index.")
+
+class _PrivateStream:
+    """Classify only operations on this private stream, never caller code."""
+    def __init__(self, stream, path):
+        self._stream, self._path = stream, path
+
+    def __getattr__(self, name):
+        value = getattr(self._stream, name)
+        if not callable(value):
+            return value
+        def call(*args, **kwargs):
+            try:
+                return value(*args, **kwargs)
+            except OSError as exc:
+                raise _private_io_error(exc, "file_" + name, self._path) from None
+        return call
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._stream)
+        except OSError as exc:
+            raise _private_io_error(exc, "file_read_next", self._path) from None
+
+@contextlib.contextmanager
+def _private_stream(stream, path):
+    proxy = _PrivateStream(stream, path)
+    try:
+        yield proxy
+    except BaseException:
+        # Closing can flush buffered data. A secondary close failure must not
+        # replace a source-access, parser, or earlier private-I/O failure.
+        try:
+            stream.close()
+        except OSError:
+            pass
+        raise
+    else:
+        proxy.close()
+
+
 def _live_fds():
     result = set()
     for value in os.listdir("/dev/fd"):
@@ -45,6 +115,8 @@ def _state_open(*args, **kwargs):
     # Serialize only their creation, never the potentially long file I/O, so a
     # concurrent export cannot be mistaken for a redirected database handle.
     with _DB_OPEN_LOCK:
+        if os.name == "nt" and args:
+            args = (private_io_path(args[0]),) + args[1:]
         return os.open(*args, **kwargs)
 
 
@@ -554,7 +626,7 @@ if os.name == "nt":
                         current = current / part
                         if create:
                             try:
-                                current.mkdir(mode=0o700)
+                                os.mkdir(private_io_path(current), mode=0o700)
                             except FileExistsError:
                                 pass
                     # The component-prefix check above proves these positions
@@ -1080,27 +1152,35 @@ class StateAccess:
         guard = None
         directory_fd = None
         try:
-            if os.name == "nt":
-                guard = _WindowsDirectories(path, create=create, code="UNSAFE_STATE", state=True)
-            else:
-                if create:
-                    try:
-                        os.mkdir(name, mode=0o700, dir_fd=self.fd)
-                    except FileExistsError:
-                        pass
-                directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                if path.resolve() != path:
-                    raise DriveError("UNSAFE_STATE", "A private state subdirectory is redirected.")
-            self.check()
+            try:
+                if os.name == "nt":
+                    guard = _WindowsDirectories(path, create=create, code="UNSAFE_STATE", state=True)
+                else:
+                    if create:
+                        try:
+                            os.mkdir(name, mode=0o700, dir_fd=self.fd)
+                        except FileExistsError:
+                            pass
+                    directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+                    if path.resolve() != path:
+                        raise DriveError("UNSAFE_STATE", "A private state subdirectory is redirected.")
+                self.check()
+            except OSError as exc:
+                raise _private_io_error(exc, "directory_open", path) from None
+            # Errors from the caller are not evidence of a bad directory. Do not
+            # catch across yield or overwrite a caller's primary exception.
             yield path
-            self.check()
-            if directory_fd is not None:
-                before = os.fstat(directory_fd)
-                after = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
-                if not stat.S_ISDIR(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                    raise DriveError("UNSAFE_STATE", "A private state subdirectory changed during the operation.")
-        except OSError:
-            raise DriveError("UNSAFE_STATE", "A private state subdirectory is missing, redirected, or inaccessible.")
+            try:
+                self.check()
+                if guard:
+                    guard.check()
+                if directory_fd is not None:
+                    before = os.fstat(directory_fd)
+                    after = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                        raise DriveError("UNSAFE_STATE", "A private state subdirectory changed during the operation.")
+            except OSError as exc:
+                raise _private_io_error(exc, "directory_verify", path) from None
         finally:
             if guard:
                 guard.close()
@@ -1456,13 +1536,16 @@ class StateAccess:
         fd = None
         with self.directory(parent):
             try:
-                if os.name == "nt":
-                    # The directory is pinned against replacement and reparse changes.
-                    fd = _state_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
-                else:
-                    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                    fd = _state_open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
-                with os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf-8"})) as output:
+                try:
+                    if os.name == "nt":
+                        # The directory is pinned against replacement and reparse changes.
+                        fd = _state_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+                    else:
+                        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+                        fd = _state_open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise _private_io_error(exc, "file_create", path) from None
+                with _private_stream(os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf-8"})), path) as output:
                     fd = None
                     yield output
             finally:
@@ -1490,22 +1573,29 @@ class StateAccess:
         parent_fd = None
         with self.directory(parent):
             try:
-                if os.name == "nt":
-                    handle = _handle(path, write=mode == "w")
-                    info = _file_info(handle)
-                    if info.st_file_attributes & (_REPARSE | _DIRECTORY) or info.st_nlink != 1 or _final_path(handle) != _canonical(path):
-                        _kernel.CloseHandle(handle)
-                        raise DriveError("UNSAFE_STATE", "A private parser file has been redirected.")
-                    fd = msvcrt.open_osfhandle(handle, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_BINARY)
-                else:
-                    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
-                    fd = _state_open(name, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
-                    info = os.fstat(fd)
-                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                        raise DriveError("UNSAFE_STATE", "A private parser file has been redirected.")
-                if mode == "w":
-                    os.ftruncate(fd, 0)
-                with os.fdopen(fd, mode, encoding="utf-8") as output:
+                try:
+                    if os.name == "nt":
+                        handle = _handle(path, write=mode == "w")
+                        try:
+                            info = _file_info(handle)
+                            if info.st_file_attributes & (_REPARSE | _DIRECTORY) or info.st_nlink != 1 or _final_path(handle) != _canonical(path):
+                                raise DriveError("UNSAFE_STATE", "A private parser file has been redirected.")
+                            fd = msvcrt.open_osfhandle(handle, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_BINARY)
+                            handle = None
+                        finally:
+                            if handle is not None:
+                                _kernel.CloseHandle(handle)
+                    else:
+                        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
+                        fd = _state_open(name, (os.O_RDWR if mode == "w" else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+                        info = os.fstat(fd)
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise DriveError("UNSAFE_STATE", "A private parser file has been redirected.")
+                    if mode == "w":
+                        os.ftruncate(fd, 0)
+                except OSError as exc:
+                    raise _private_io_error(exc, "file_open_" + mode, path) from None
+                with _private_stream(os.fdopen(fd, mode, encoding="utf-8"), path) as output:
                     fd = None
                     yield output
             finally:
@@ -1518,7 +1608,12 @@ class StateAccess:
         parent, name = self._private_location(path)
         with self.directory(parent):
             if os.name == "nt":
-                Path(path).unlink(missing_ok=True)
+                try:
+                    os.unlink(private_io_path(path))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise _private_io_error(exc, "file_delete", path) from None
             else:
                 fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fd)
                 try:
@@ -1535,7 +1630,7 @@ class StateAccess:
             raise DriveError("UNSAFE_STATE", "Unexpected temporary directory name.")
         try:
             if os.name == "nt":
-                os.rmdir(self.path / name)
+                os.rmdir(private_io_path(self.path / name))
             else:
                 os.rmdir(name, dir_fd=self.fd)
         except OSError:
@@ -1554,19 +1649,19 @@ class StateAccess:
             raise DriveError("STATE_NOT_LEASED", "Scratch cleanup requires an exclusive state lease.")
         result = {"removed_files": 0, "removed_directories": 0, "skipped_directories": 0,
                   "eligible_files": 0, "eligible_directories": 0, "dry_run": dry_run}
-        for name in os.listdir(self.path if os.name == "nt" else self.fd):
+        for name in os.listdir(private_io_path(self.path) if os.name == "nt" else self.fd):
             if re.fullmatch(r"job-temp-[0-9a-f]{32}", name) is None:
                 continue
             try:
                 with self.directory(name) as folder:
-                    with os.scandir(folder) as entries:
+                    with os.scandir(private_io_path(folder)) as entries:
                         children = list(entries)
                     safe = True
                     for entry in children:
                         # Windows DirEntry caches report nlink/ino/dev as zero.
                         # Query the pinned-directory child for real link count;
                         # never treat an unknown/zero count as a safe single link.
-                        info = os.stat(folder / entry.name, follow_symlinks=False)
+                        info = os.stat(private_io_path(folder / entry.name), follow_symlinks=False)
                         recognized = re.fullmatch(r"(?:parsed-[0-9a-f]{32}\.jsonl|snapshot-[0-9a-f]{32}\.(?:txt|md|csv|tsv|xlsx|docx|pptx|pdf))", entry.name)
                         if not recognized or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or getattr(info, "st_file_attributes", 0) & 0x400:
                             safe = False
@@ -1582,7 +1677,7 @@ class StateAccess:
                         self.unlink_private(folder / entry.name)
                         result["removed_files"] += 1
                 self.remove_empty_directory(name)
-                if not (self.path / name).exists():
+                if not os.path.exists(private_io_path(self.path / name)):
                     result["removed_directories"] += 1
             except (DriveError, OSError):
                 # Unknown or concurrently altered contents need manual review.
