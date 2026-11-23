@@ -126,9 +126,9 @@ try {
   const client = await connect(configured);
   const tools = await client.listTools();
   assert.equal(tools.tools.length, 18);
-  assert.equal(client.getServerVersion().version, '0.7.0');
+  assert.equal(client.getServerVersion().version, '0.8.0');
   const status = await ready(client);
-  assert.equal(status.service_version, '0.7.0');
+  assert.equal(status.service_version, '0.8.0');
   assert.equal(status.provider, 'microsoft_graph');
   assert.equal(status.coverage.present_files, 1);
   assert.equal(status.capabilities.http_mcp, false);
@@ -208,7 +208,7 @@ try {
   const auth = await call(missing, 'status', {}, false);
   assert.equal(auth.error.code, 'AUTH_REQUIRED');
   assert.doesNotMatch(stderr.join(''), /Traceback|PRIVATE_CLOUD_FIXTURE|synthetic-cloud-token/);
-  console.log(JSON.stringify({ passed: true, tools: 18, serviceVersion: '0.7.0', provider: 'microsoft_graph',
+  console.log(JSON.stringify({ passed: true, tools: 18, serviceVersion: '0.8.0', provider: 'microsoft_graph',
     sdkStdioBrokerParserStorage: true, scopedCloudProvenance: true, revokedCachedSearchBlocked: true, revokedWikiBlocked: true,
     offlineNotDeleted: true, authMissingExplicit: true, emptyAnchor: true,
     realMicrosoftNetwork: false, realTenantValidated: false }, null, 2));

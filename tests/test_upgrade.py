@@ -8,7 +8,7 @@ from pathlib import Path
 
 from team_drive.engine import Engine
 from team_drive.errors import DriveError
-from team_drive import diagnostics
+from team_drive import diagnostics, retrieval
 
 
 class UpgradeTests(unittest.TestCase):
@@ -266,9 +266,21 @@ class EngineModelTests(unittest.TestCase):
     def test_model_timeout_is_bounded_and_next_scan_resumes_without_reembedding_unchanged_text(self):
         self.write('terms.txt', 'synthetic source survives timeout')
         self.model.delay = 0.6
-        started = time.monotonic()
-        scan = self.engine.scan_once()
-        self.assertLess(time.monotonic() - started, 2)
+        http_durations = []
+        original_post = retrieval._post
+
+        def measured_post(*args, **kwargs):
+            started = time.monotonic()
+            try:
+                return original_post(*args, **kwargs)
+            finally:
+                http_durations.append(time.monotonic() - started)
+
+        # Measure the model deadline separately from parser and filesystem work.
+        with mock.patch.object(retrieval, '_post', side_effect=measured_post):
+            scan = self.engine.scan_once()
+        self.assertTrue(http_durations)
+        self.assertLess(max(http_durations), 2)
         self.assertEqual(scan['job']['status'], 'complete')
         file = self.engine.list()['files'][0]
         self.assertEqual(file['status'], 'ready')

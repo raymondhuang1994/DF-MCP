@@ -95,13 +95,13 @@ class ResumableScan:
                        (path, len(path.split('/')) if path else 0, json.dumps(fingerprint[:2])))
             db.execute("UPDATE scan_cycle SET phase='collect',verify_target='collect',verify_after=NULL,collect_verified=0 WHERE singleton=1")
 
-    def _parse_pending(self, job_id, progress, counters, deadline):
+    def _parse_pending(self, job_id, progress, counters, deadline, cycle_id):
         e = self.engine
         last_path = ""
         while job_id not in e._cancelled and not e._stop.is_set():
             e._source._deadline(deadline)
             with e._db() as db:
-                row = db.execute("SELECT * FROM files WHERE status='pending' AND path>? ORDER BY path LIMIT 1", (last_path,)).fetchone()
+                row = db.execute("SELECT * FROM files WHERE (status='pending' OR (status IN ('ready','failed') AND needs_reparse=1)) AND seen_scan=? AND path>? ORDER BY path LIMIT 1", (cycle_id, last_path)).fetchone()
             if row is None:
                 break
             progress.set_stage("parsing")
@@ -141,7 +141,10 @@ class ResumableScan:
         try:
             # A process can stop after publishing a verified batch but before
             # parsing it. Retry these rows even if no unvisited directory remains.
-            self._parse_pending(job_id, progress, counters, deadline)
+            # Only retry rows already published in this cycle. An unvisited
+            # scope must first be enumerated, especially during a forced cycle
+            # that would otherwise discard and parse the same upgrade twice.
+            self._parse_pending(job_id, progress, counters, deadline, cycle_id)
             while True:
                 if job_id in e._cancelled or e._stop.is_set():
                     outcome = "cancelled"
@@ -193,7 +196,7 @@ class ResumableScan:
                 consumed += batch["entries"]
                 # Publish and parse this verified subset now; a later timeout
                 # cannot discard it or turn an unfinished scope into absence.
-                self._parse_pending(job_id, progress, counters, deadline)
+                self._parse_pending(job_id, progress, counters, deadline, cycle_id)
                 e._checkpoint(force=True)
         except DriveError as exc:
             error_code = exc.code

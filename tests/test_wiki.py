@@ -89,6 +89,33 @@ class WikiTests(unittest.TestCase):
         self.assertTrue(result["page"]["derived"])
         self.assertEqual(result["page"]["review_status"], "unreviewed")
 
+    def test_parser_upgrade_invalidates_wiki_without_changing_source_version(self):
+        citation = self.file("budget.txt", "SIMULATED budget 100 units.\n")
+        self.write_page(citation=citation)
+        with self.engine._db() as db:
+            db.execute("UPDATE files SET needs_reparse=1 WHERE id=?", (citation["file_id"],))
+        self.assertEqual(self.wiki.status()["counts"], {"current": 0, "stale": 1})
+        self.assert_code("WIKI_STALE", self.wiki.read, "budget")
+        self.assert_code("EXTRACTION_UPDATE_REQUIRED", self.write_page, "new-budget", citation=citation)
+        self.assertEqual(self.wiki.refresh()["pending_total"], 1)
+        self.engine.scan_once()
+        self.wiki.refresh()
+        self.assertEqual(self.wiki.read("budget")["page"]["citations"], [citation])
+
+    def test_parser_upgrade_racing_publication_is_rejected(self):
+        citation = self.file("budget.txt", "SIMULATED budget 100 units.\n")
+        verify = self.wiki._verify
+
+        def invalidate_after_verification(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            with self.engine._db() as db:
+                db.execute("UPDATE files SET needs_reparse=1 WHERE id=?", (citation["file_id"],))
+            return result
+
+        with mock.patch.object(self.wiki, "_verify", side_effect=invalidate_after_verification):
+            self.assert_code("INDEX_CHANGED", self.write_page, citation=citation)
+        self.assertEqual(self.wiki.status()["counts"]["current"], 0)
+
     def test_changed_original_cannot_serve_cached_title_or_body(self):
         citation = self.file("budget.txt", "SIMULATED budget 100 units.\n")
         self.write_page(citation=citation, title="SENSITIVE_CACHED_TITLE", body="SENSITIVE_CACHED_BODY [1]")

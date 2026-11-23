@@ -186,6 +186,91 @@ class ResumableScanTests(unittest.TestCase):
         self.assertEqual(result["coverage"]["indexed_files"], 2)
         self.assertEqual(self.calls.count("a"), 1)
 
+    def test_parser_upgrade_timeout_preserves_partial_cycle_and_retries_after_restart(self):
+        self.fixture()
+        self.fail_scope = "b"
+        first = self.engine.scan_once()
+        cycle_id = first["coverage"]["scan_resume"]["cycle_id"]
+        item = self.engine.search("alpha")["files"][0]
+        with self.engine._db() as db:
+            saved_segments = [tuple(row) for row in db.execute("SELECT * FROM segments ORDER BY file_id,ordinal")]
+            db.execute("UPDATE meta SET value='synthetic-previous-parser' WHERE key='parse_binding'")
+            db.execute("UPDATE files SET indexed_parse_binding='synthetic-previous-parser' WHERE status='ready'")
+        self.engine.close()
+        self.engine = Engine(str(self.config), autostart=False)
+        self.fail_scope = None
+
+        with mock.patch.object(self.engine, "_digest", side_effect=DriveError("SHARE_TIMEOUT", "Synthetic reparse timeout", True)):
+            timed_out = self.engine.scan_once()
+        self.assertEqual(timed_out["job"]["status"], "partial")
+        self.assertEqual(timed_out["job"]["error_code"], "SHARE_TIMEOUT")
+        self.assertEqual(timed_out["coverage"]["scan_resume"]["cycle_id"], cycle_id)
+        self.assertEqual(timed_out["coverage"]["pending_reparse"], 1)
+        self.assertEqual(timed_out["coverage"]["current_indexed_files"], 0)
+        with self.engine._db() as db:
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM segments ORDER BY file_id,ordinal")], saved_segments)
+        candidate = self.engine.search("alpha")["files"][0]
+        self.assertTrue(candidate["pending_reparse"])
+        self.assertFalse(candidate["extraction_current"])
+        blocked = self.engine.call("read", {"file_id": item["file_id"], "expected_version": item["source_version"]})
+        self.assertEqual(blocked["error"]["code"], "EXTRACTION_UPDATE_REQUIRED")
+        self.assertNotIn("segments", blocked)
+
+        self.engine.close()
+        self.engine = Engine(str(self.config), autostart=False)
+        restarted = self.engine.status()
+        self.assertEqual(restarted["coverage"]["pending_reparse"], 1)
+        self.assertEqual(restarted["coverage"]["parse_generation"], 2)
+        recovered = self.engine.scan_once()
+        self.assertEqual(recovered["job"]["status"], "complete")
+        self.assertEqual(recovered["coverage"]["scan_resume"]["cycle_id"], cycle_id)
+        self.assertEqual(recovered["coverage"]["current_indexed_files"], 2)
+        self.assertEqual(recovered["coverage"]["pending_reparse"], 0)
+        self.assertTrue(recovered["coverage"]["inventory_complete"])
+        self.assertEqual(self.calls.count("a"), 1)
+        self.assertTrue(self.engine.read(item["file_id"], expected_version=item["source_version"])["ok"])
+
+    def test_forced_parser_upgrade_parses_each_file_only_once(self):
+        self.fixture()
+        first = self.engine.scan_once()
+        with self.engine._db() as db:
+            db.execute("UPDATE meta SET value='synthetic-previous-parser' WHERE key='parse_binding'")
+        self.engine.close()
+        self.engine = Engine(str(self.config), autostart=False)
+        self.assertEqual(self.engine.status()["coverage"]["pending_reparse"], 2)
+
+        with mock.patch.object(self.engine, "_parse_file", wraps=self.engine._parse_file) as parse:
+            upgraded = self.engine.scan_once(force=True)
+        self.assertEqual([call.args[0]["path"] for call in parse.call_args_list], ["a/alpha.txt", "b/beta.txt"])
+        self.assertNotEqual(upgraded["coverage"]["scan_resume"]["cycle_id"], first["coverage"]["scan_resume"]["cycle_id"])
+        self.assertEqual(upgraded["job"]["status"], "complete")
+        self.assertEqual(upgraded["coverage"]["current_indexed_files"], 2)
+        self.assertEqual(upgraded["coverage"]["pending_reparse"], 0)
+
+    def test_parser_upgrade_resuming_forced_cycle_does_not_preparse_unvisited_files(self):
+        self.fixture()
+        self.engine.scan_once()
+        self.fail_scope = "b"
+        partial = self.engine.scan_once(force=True)
+        self.assertEqual(partial["job"]["status"], "partial")
+        cycle_id = partial["coverage"]["scan_resume"]["cycle_id"]
+        with self.engine._db() as db:
+            db.execute("UPDATE meta SET value='synthetic-previous-parser' WHERE key='parse_binding'")
+        self.engine.close()
+        self.engine = Engine(str(self.config), autostart=False)
+        self.assertEqual(self.engine.status()["coverage"]["pending_reparse"], 2)
+        self.fail_scope = None
+
+        with mock.patch.object(self.engine, "_parse_file", wraps=self.engine._parse_file) as parse:
+            resumed = self.engine.scan_once()
+        self.assertEqual([call.args[0]["path"] for call in parse.call_args_list], ["a/alpha.txt", "b/beta.txt"])
+        self.assertEqual(resumed["coverage"]["scan_resume"]["cycle_id"], cycle_id)
+        self.assertTrue(resumed["coverage"]["scan_resume"]["resumed"])
+        self.assertEqual(resumed["job"]["status"], "complete")
+        self.assertEqual(resumed["coverage"]["current_indexed_files"], 2)
+        self.assertEqual(resumed["coverage"]["pending_reparse"], 0)
+        self.assertEqual(self.calls.count("a"), 2)
+
     def test_changed_mapping_cannot_reuse_resume_checkpoint(self):
         self.fixture()
         self.fail_scope = "b"

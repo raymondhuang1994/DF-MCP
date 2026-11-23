@@ -1,5 +1,7 @@
 # Python tool entrypoint
 
+For explicit profile selection (`df-sources.py`, `--profile-id`, `--config-fingerprint`) and optional `--evidence-envelope`, see [source selection and evidence handoff](integration.md). Default native responses stay compatible; catalog discovery does not connect, while a selected tool invocation can start the configured scan.
+
 Paths below are relative to the extracted Skill root. Use the approved Python 3.9+ interpreter. The ZIP vendors pinned pure-Python parser libraries; Node/npm is unnecessary for this entrypoint. Original stdio MCP continues to require its Node runtime.
 
 ```text

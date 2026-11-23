@@ -49,6 +49,20 @@ def collect(bridge, method, params, max_pages=100):
         raise DriveError("INVALID_PARAMS", "--paginate is supported for list, search, inspect and read.")
     if isinstance(max_pages, bool) or not isinstance(max_pages, int) or not 1 <= max_pages <= 1000:
         raise DriveError("INVALID_PARAMS", "max_pages must be between 1 and 1000.")
+    params = dict(params)
+    if method in ("list", "search"):
+        status = bridge.call("status", {})
+        if not status.get("ok"):
+            return dict(status, readiness={"method": "status", "result": status})
+        if status.get("current_job_id"):
+            return dict(readiness_failure(status, "status", "INDEX_STILL_RUNNING", "Wait for the current batch before paginating the index.", True,
+                                         "Track this job or use a bounded non-paginated query with explicit coverage."),
+                        current_job_id=status["current_job_id"], coverage=status.get("coverage", {}),
+                        pagination_complete=False, pages_discarded=0)
+        if status.get("provider") == "windows_share":
+            requested_limit = params.get("limit", 20 if method == "list" else 10)
+            if isinstance(requested_limit, int) and not isinstance(requested_limit, bool) and 1 <= requested_limit <= 100:
+                params["limit"] = min(requested_limit, 8)
     pages, size, cursor = [], 0, None
     for unused in range(max_pages):
         request = dict(params)
@@ -77,38 +91,73 @@ def collect(bridge, method, params, max_pages=100):
             "next_action": "Restart with a larger --max-pages or narrower scope; cursors are connection-local."}
 
 
+def readiness_failure(result, method, code, message, retryable, next_action):
+    """Keep the actual observation behind a CLI readiness decision intact."""
+    return dict(failure(code, message, retryable, next_action),
+                coverage=result.get("coverage", {}), index_status=result.get("index_status", {}),
+                readiness={"method": method, "result": result})
+
+
 def wait_ready(bridge, seconds):
     deadline = time.monotonic() + seconds
     while True:
         result = bridge.call("status", {})
         if not result.get("ok"):
-            return result
+            return dict(result, readiness={"method": "status", "result": result})
+        observation, observation_method = result, "status"
         job_id = result.get("current_job_id")
         if job_id:
             job = bridge.call("job_status", {"job_id": job_id})
             if not job.get("ok"):
-                return job
+                return dict(job, readiness={"method": "job_status", "result": job})
+            observation, observation_method = job, "job_status"
             state = job.get("job", {}).get("status")
             if state == "partial":
-                return failure("INDEX_PARTIAL", "Verified batches are available, but some directories remain unscanned.", True,
-                               "Use ordinary queries with explicit coverage, or refresh without force to resume. Check job_status for remaining scopes.")
+                return readiness_failure(job, "job_status", "INDEX_PARTIAL", "Verified batches are available, but some directories remain unscanned.", True,
+                                         "Use ordinary queries with explicit coverage, or refresh without force to resume. Check job_status for remaining scopes.")
             if state in ("failed", "cancelled"):
-                return failure("INDEX_NOT_READY", "The indexing job did not complete.", False,
-                               "Inspect job_status and the reported coverage gaps.")
+                return readiness_failure(job, "job_status", "INDEX_NOT_READY", "The indexing job did not complete.", False,
+                                         "Inspect job_status and the reported coverage gaps.")
             if state == "complete":
-                return result
+                result = bridge.call("status", {})
+                if not result.get("ok"):
+                    return dict(result, readiness={"method": "status", "result": result})
+                observation, observation_method = result, "status"
+                if not result.get("current_job_id"):
+                    return usable_inventory(result)
         elif result.get("coverage", {}).get("inventory_complete") is True:
-            return result
+            return usable_inventory(result)
+        elif result.get("index_status", {}).get("state") == "partial":
+            return readiness_failure(result, "status", "INDEX_PARTIAL", "Verified batches are available; the inventory remains incomplete.", True,
+                                     "Use bounded queries with explicit coverage, or refresh without force to resume.")
+        elif result.get("index_status", {}).get("state") in ("blocked", "failed", "cancelled"):
+            return readiness_failure(result, "status", "INDEX_NOT_READY", "The index requires recovery before it can be used.", False,
+                                     "Inspect the reported runtime error and explicitly retry after repair.")
         if time.monotonic() >= deadline:
-            return failure("INDEX_STILL_RUNNING", "The bounded wait ended; indexing may still be running.", True,
-                           "Check status/job_status. Do not start another index or invent completion.")
+            return readiness_failure(observation, observation_method, "INDEX_STILL_RUNNING", "The bounded wait ended; indexing may still be running.", True,
+                                     "Check status/job_status. Do not start another index or invent completion.")
         time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+
+
+def usable_inventory(result):
+    coverage = result.get("coverage", {})
+    current = coverage.get("current_indexed_files", coverage.get("indexed_files", 0))
+    if (result.get("index_status", {}).get("state") == "blocked" or
+            (coverage.get("present_files", 0) > 0 and current == 0)):
+        return readiness_failure(result, "status", "INDEX_NOT_READABLE", "No current extraction is available, or the index has a runtime blocker.", False,
+                                 "Inspect coverage and pending_reparse; finish extraction or repair the runtime before calculating totals.")
+    return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="DF evidence tools: JSON output, read-only source, private local state.")
     parser.add_argument("method", choices=METHODS)
-    parser.add_argument("--config", required=True)
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument("--config")
+    sources.add_argument("--profile-id", help="Exact ID from df-sources.py; never selects another profile implicitly")
+    parser.add_argument("--state-dir", help="Configured profile catalog base; only with --profile-id")
+    parser.add_argument("--config-fingerprint", help="Configuration fingerprint previously reviewed in the source catalog")
+    parser.add_argument("--evidence-envelope", action="store_true", help="Preserve the native result inside a source-bound evidence envelope")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--params")
     group.add_argument("--params-file")
@@ -117,13 +166,24 @@ def main(argv=None):
     parser.add_argument("--wait-ready", type=float, default=0, metavar="SECONDS")
     args = parser.parse_args(argv)
     bridge = None
+    selected = None
+    params = {}
     try:
         if not 0 <= args.wait_ready <= 120:
             raise DriveError("INVALID_PARAMS", "--wait-ready must be between 0 and 120 seconds.")
         params = parameters(args.params, args.params_file)
         if args.paginate and args.method not in PAGED:
             raise DriveError("INVALID_PARAMS", "This method does not paginate.")
-        bridge = Bridge(args.config)
+        if args.profile_id:
+            from .catalog import select
+            selected = select(args.profile_id, args.state_dir, args.config_fingerprint)["selected"]
+            config_path, fingerprint = selected["config_path"], selected["config_fingerprint"]
+        else:
+            if args.state_dir is not None:
+                raise DriveError("INVALID_PARAMS", "--state-dir applies only to an explicit --profile-id.")
+            config_path, fingerprint = args.config, args.config_fingerprint
+        bridge = (Bridge(config_path, expected_config_fingerprint=fingerprint) if fingerprint is not None
+                  else Bridge(config_path))
         ready = wait_ready(bridge, args.wait_ready) if args.wait_ready else {"ok": True}
         if not ready.get("ok"):
             result = ready
@@ -147,5 +207,13 @@ def main(argv=None):
     finally:
         if bridge is not None:
             bridge.close()
+    if args.evidence_envelope:
+        from .evidence import envelope
+        try:
+            result = envelope(result, args.method, bridge.config if bridge else None, params,
+                              selected=selected if bridge else None)
+        except DriveError as exc:
+            result = failure(exc.code, exc.message, exc.retryable, exc.next_action)
+            exit_code = 1
     print(json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":")), flush=True)
     return exit_code

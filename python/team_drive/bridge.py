@@ -39,8 +39,11 @@ def connect_endpoint(endpoint):
 
 
 class Bridge:
-    def __init__(self, config_path):
+    def __init__(self, config_path, expected_config_fingerprint=None):
         self.config = settings(config_path)
+        if expected_config_fingerprint is not None and self.config.get("config_fingerprint") != expected_config_fingerprint:
+            raise DriveError("CONFIG_CHANGED", "The selected source configuration changed before connecting.", False,
+                             "Inspect the source catalog and review the selected scope again.")
         self.connection = None
         self.session_id = None
         self.instance_id = None
@@ -98,9 +101,17 @@ class Bridge:
                 # down. Retry an exited contender at most once per second,
                 # within the same overall startup deadline; never replay calls.
                 if spawned is None or (spawned.poll() is not None and time.monotonic() - last_spawn >= 1):
+                    if spawned is not None:
+                        current = settings(self.config["path"])
+                        if (current["config_id"] != self.config["config_id"] or
+                                current["config_fingerprint"] != self.config["config_fingerprint"]):
+                            raise DriveError("CONFIG_CHANGED", "The selected source configuration changed while starting the reader.", False,
+                                             "Review the source catalog again before reconnecting.")
                     options = {"start_new_session": True} if os.name != "nt" else {
                         "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
-                    spawned = subprocess.Popen([sys.executable, "-m", "team_drive.broker", "--config", str(self.config["path"])],
+                    spawned = subprocess.Popen([sys.executable, "-m", "team_drive.broker", "--config", str(self.config["path"]),
+                                                "--expected-config-id", self.config["config_id"],
+                                                "--expected-config-fingerprint", self.config["config_fingerprint"]],
                                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                                close_fds=True, **options)
                     last_spawn = time.monotonic()

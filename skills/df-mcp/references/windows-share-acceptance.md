@@ -17,7 +17,7 @@ python -B -c "import sys;sys.path.insert(0,'scripts');from _df_runtime import bo
 python scripts/df-init.py profiles
 ```
 
-运行时应为 `0.7.0`，模块路径应落在当前正式安装的 `runtime/python/team_drive` 中。SkillHub 的显示版本（例如 `0.2.0`）独立管理，不能用它判断内置程序版本。已有配置使用自定义状态基目录时，`profiles` 需传原来的 `--state-dir`；不要扫描整台电脑寻找配置。
+运行时应为 `0.8.0`，模块路径应落在当前正式安装的 `runtime/python/team_drive` 中。SkillHub 的显示版本（例如 `0.2.0`）独立管理，不能用它判断内置程序版本。已有配置使用自定义状态基目录时，`profiles` 需传原来的 `--state-dir`；不要扫描整台电脑寻找配置。
 
 ## 2. 正式计划：先检查来源和本地索引位置
 
@@ -70,7 +70,7 @@ python scripts/df-tool.py job_status --config <返回的config_path> --params-fi
 
 `job.json` 为 `{"job_id":"<status实际返回的current_job_id>"}`。若没有 current_job_id，可不传 params-file 查询最新任务，并结合 status 的覆盖情况解释结果。`INDEX_STILL_RUNNING` 表示这次等待结束，继续检查既有任务；不创建第二个索引。任务 failed/cancelled 或来源不可访问时，保留失败状态，不能从旧缓存声称当前资料可读。
 
-核对实际 `service_version` 为 `0.7.0`、provider 为 `windows_share`，来源绑定与确认卡一致。报告任务状态和 `coverage` 的 `inventory_complete`、`present_files`、`indexed_files`、`partial_files`、`states`。扫描阶段另看 job.scan_progress：已枚举或待发布数不等于正式索引文件数。失败时报告 error_detail 的阶段、操作和错误码；不要把服务健康当作索引成功。明确列出 failed/blocked/unsupported/online_only/oversized/pending 等实际缺口；需要具体文件时用下面的 list 返回其 `error`、`format_warnings` 和 `content_coverage`。未完成全量分页时不得声称已列尽所有失败文件。
+核对实际 `service_version` 为 `0.8.0`、provider 为 `windows_share`，来源绑定与确认卡一致。报告任务状态和 `coverage` 的 `inventory_complete`、`present_files`、`indexed_files`、`partial_files`、`states`。扫描阶段另看 job.scan_progress：已枚举或待发布数不等于正式索引文件数。失败时报告 error_detail 的阶段、操作和错误码；不要把服务健康当作索引成功。明确列出 failed/blocked/unsupported/online_only/oversized/pending 等实际缺口；需要具体文件时用下面的 list 返回其 `error`、`format_warnings` 和 `content_coverage`。未完成全量分页时不得声称已列尽所有失败文件。
 
 ## 4. 至少一个真实文件 inspect → read
 

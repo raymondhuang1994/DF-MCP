@@ -9,7 +9,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DEPENDENCIES = {"pypdf": ("6.21.2", {"pypdf"}), "defusedxml": ("0.7.1", {"defusedxml"}),
                 "typing_extensions": ("4.16.0", {"typing_extensions.py"})}
-SCRIPTS = ("_df_runtime.py", "df-tool.py", "df-init.py", "df-cloud.py", "df-check.py")
+SCRIPTS = ("_df_runtime.py", "df-tool.py", "df-init.py", "df-cloud.py", "df-check.py", "df-sources.py")
 
 
 def build(output):

@@ -315,7 +315,11 @@ def profiles(state_dir=None):
                         if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9!._~-]{1,256}", item) or item in (".", "..", "root"):
                             raise ValueError()
                     source = {"drive_id": graph["drive_id"], "folder_id": graph["folder_id"]}
-                found.append({"provider": provider, "source": source, "config_path": str(config_path),
+                found.append({"profile_id": profile.name,
+                              "catalog_source_id": _digest({"provider": provider, "source": source,
+                                                    "identity": config.get("approved_source_identity")}),
+                              "config_fingerprint": _digest(config),
+                              "provider": provider, "source": source, "config_path": str(config_path),
                               "state_path": str(state_path), "source_availability": "not_checked"})
             except (DriveError, OSError, ValueError, TypeError):
                 warnings.append({"code": "PROFILE_SKIPPED", "message": "An unsafe or invalid profile configuration was skipped."})

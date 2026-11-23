@@ -11,7 +11,7 @@ from .fs_access import validate_state_location
 from .retrieval import validate_config as retrieval_settings
 from .diagnostics import settings as diagnostic_settings
 
-SERVICE_VERSION = "0.7.0"
+SERVICE_VERSION = "0.8.0"
 PROTOCOL_VERSION = 1
 
 
@@ -23,6 +23,8 @@ def settings(config_path):
         if len(raw_config) > 262144:
             raise ValueError()
         config = json.loads(raw_config.decode("utf-8"))
+        config_fingerprint = hashlib.sha256(json.dumps(config, ensure_ascii=False, sort_keys=True,
+                                                     separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
         if not isinstance(config, dict) or config.get("provider", "local") not in ("local", "microsoft_graph", "windows_share"):
             raise ValueError()
         for key in ("root", "state_dir"):
@@ -36,13 +38,16 @@ def settings(config_path):
             config[key] = str((raw if raw.is_absolute() else path.parent / raw).absolute())
         validate_state_location(config["state_dir"])
         service = config.get("service", {})
-        if not isinstance(service, dict) or set(service) - {"idle_seconds", "max_clients"}:
+        if not isinstance(service, dict) or set(service) - {"idle_seconds", "max_clients", "scan_grace_seconds"}:
             raise ValueError()
         idle = service.get("idle_seconds", 60)
         clients = service.get("max_clients", 64)
+        scan_grace = service.get("scan_grace_seconds", 600)
         if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not 1 <= idle <= 3600 or not math.isfinite(idle):
             raise ValueError()
         if isinstance(clients, bool) or not isinstance(clients, int) or not 1 <= clients <= 256:
+            raise ValueError()
+        if isinstance(scan_grace, bool) or not isinstance(scan_grace, (int, float)) or not 0 <= scan_grace <= 3600 or not math.isfinite(scan_grace):
             raise ValueError()
         poll = config.get("poll_seconds", 30)
         if isinstance(poll, bool) or not isinstance(poll, (int, float)) or not 1 <= poll <= 86400 or not math.isfinite(poll):
@@ -60,7 +65,7 @@ def settings(config_path):
                          aliases={key: sorted(set(values)) for key, values in aliases.items()},
                          retrieval=retrieval_settings(config.get("retrieval", {})),
                          diagnostics=diagnostic_settings(config.get("diagnostics")),
-                         service={"idle_seconds": float(idle), "max_clients": clients})
+                         service={"idle_seconds": float(idle), "max_clients": clients, "scan_grace_seconds": float(scan_grace)})
         effective.pop("state_pool", None)  # A legacy pool setting cannot create extra shared indexes.
         effective["root"] = (config["root"] if effective["provider"] == "windows_share" else
                              os.path.normcase(str(Path(config["root"]).resolve())))
@@ -83,6 +88,7 @@ def settings(config_path):
             code.update(source.read_bytes())
         return {"path": path, "root": Path(config["root"]), "base": Path(config["state_dir"]),
                 "config_id": hashlib.sha256(binding.encode()).hexdigest(), "code_id": code.hexdigest(),
-                "idle_seconds": float(idle), "max_clients": clients, "config": effective}
+                "config_fingerprint": config_fingerprint,
+                "idle_seconds": float(idle), "max_clients": clients, "scan_grace_seconds": float(scan_grace), "config": effective}
     except (OSError, ValueError, TypeError, OverflowError):
         raise DriveError("INVALID_CONFIG", "Use a valid source configuration and bounded service settings.")

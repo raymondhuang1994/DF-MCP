@@ -217,7 +217,7 @@ class EngineTests(unittest.TestCase):
             Engine(str(self.config), autostart=False)
         self.assertEqual(caught.exception.code, "STATE_ROOT_MISMATCH")
 
-    def test_config_changes_invalidate_old_parses(self):
+    def test_config_changes_retain_candidates_until_reparsed(self):
         self.write("source.txt", "SIMULATED budget")
         self.engine.scan_once()
         self.assertEqual(self.engine.status()["coverage"]["indexed_files"], 1)
@@ -226,10 +226,18 @@ class EngineTests(unittest.TestCase):
         config["limits"] = {"max_segment_chars": 4000}
         self.config.write_text(json.dumps(config))
         self.engine = Engine(str(self.config), autostart=False)
-        self.assertEqual(self.engine.status()["coverage"]["indexed_files"], 0)
-        self.assertEqual(self.engine.search("budget")["files"], [])
+        coverage = self.engine.status()["coverage"]
+        self.assertEqual(coverage["indexed_files"], 1)
+        self.assertEqual(coverage["current_indexed_files"], 0)
+        self.assertEqual(coverage["pending_reparse"], 1)
+        candidate = self.engine.search("budget")["files"][0]
+        self.assertTrue(candidate["pending_reparse"])
+        self.assertFalse(candidate["extraction_current"])
+        self.assertEqual(self.engine.call("read", {"file_id": candidate["file_id"]})["error"]["code"], "EXTRACTION_UPDATE_REQUIRED")
         self.engine.scan_once()
         self.assertEqual(self.engine.search("budget")["total_matching_files"], 1)
+        self.assertEqual(self.engine.status()["coverage"]["current_indexed_files"], 1)
+        self.assertEqual(self.engine.status()["coverage"]["pending_reparse"], 0)
 
     def test_unchanged_failure_not_retried_without_force(self):
         self.write("source.txt", "SIMULATED")
@@ -560,13 +568,18 @@ class EngineTests(unittest.TestCase):
         started = threading.Event()
         def interrupted(engine, snapshot, parsed):
             started.set()
-            if not engine._stop.wait(5):
+            if not engine._stop.wait(30):
                 raise AssertionError("Test shutdown did not arrive")
             raise DriveError("PARSE_FAILED", "Synthetic killed parser")
         with mock.patch.object(Engine, "_extract", autospec=True, side_effect=interrupted):
             self.engine = Engine(str(self.config), autostart=True)
-            self.assertTrue(started.wait(3))
+            self.assertTrue(started.wait(30))
             self.engine.close()
+            # close() is bounded; Windows can still be completing guarded
+            # cleanup after its two-second join. Reopen only once that worker
+            # has stopped, while keeping the test's shutdown wait bounded.
+            self.engine._thread.join(timeout=30)
+            self.assertFalse(self.engine._thread.is_alive())
         self.engine = Engine(str(self.config), autostart=False)
         self.assertEqual(self.engine.list()["files"][0]["status"], "pending")
         self.engine.scan_once()

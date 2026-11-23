@@ -67,8 +67,14 @@ def socket_location(config, source, installation):
 
 
 class Broker:
-    def __init__(self, config_path):
+    def __init__(self, config_path, expected_config_id=None, expected_config_fingerprint=None):
         self.config = settings(config_path)
+        if ((expected_config_id is not None and expected_config_id != self.config["config_id"]) or
+                (expected_config_fingerprint is not None and expected_config_fingerprint != self.config["config_fingerprint"])):
+            # Check before source access or private state creation. A handshake
+            # rejection is too late if a changed source has already started.
+            raise DriveError("CONFIG_CHANGED", "The configuration changed before broker startup.", False,
+                             "Select the current approved profile again before connecting.")
         self.stop_event = threading.Event()
         self.clients_lock = threading.Lock()
         self.call_lock = threading.Lock()
@@ -152,6 +158,7 @@ class Broker:
                                           state_storage={**result.get("state_storage", {}), "mode": "shared", "persistent": True, "index_copies": 1,
                                                          "active_clients": active, "max_clients": self.config["max_clients"],
                                                          "idle_seconds": self.config["idle_seconds"],
+                                                          "scan_grace_seconds": self.config["scan_grace_seconds"],
                                                          "recovery_policy": "last_completed_checkpoint"})
                     finally:
                         self.call_lock.release()
@@ -190,13 +197,22 @@ class Broker:
                 self.connections.add(connection)
             threading.Thread(target=self.handle, args=(connection,), daemon=True).start()
 
+    def _idle_shutdown_due(self, now):
+        """An active scan gets one bounded grace period after the last client."""
+        if self.connections:
+            return False
+        deadline = self.last_empty + self.config["idle_seconds"]
+        if self.engine is not None and self.engine._pending_job:
+            deadline += self.config["scan_grace_seconds"]
+        return now >= deadline
+
     def run(self):
         thread = threading.Thread(target=self.accept, daemon=True)
         thread.start()
         try:
             while not self.stop_event.wait(0.25):
                 with self.clients_lock:
-                    idle = not self.connections and time.monotonic() - self.last_empty >= self.config["idle_seconds"]
+                    idle = self._idle_shutdown_due(time.monotonic())
                     if idle:
                         self.stop_event.set()
                 if idle:
@@ -234,10 +250,13 @@ class Broker:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--expected-config-id")
+    parser.add_argument("--expected-config-fingerprint")
     args = parser.parse_args()
     broker = None
     try:
-        broker = Broker(args.config)
+        broker = Broker(args.config, expected_config_id=args.expected_config_id,
+                        expected_config_fingerprint=args.expected_config_fingerprint)
         def terminate(signum, frame):
             broker.stop_event.set()
         signal.signal(signal.SIGTERM, terminate)

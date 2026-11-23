@@ -24,8 +24,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 from collections import OrderedDict
 
-from .errors import DriveError
-from .fs_access import SourceAccess, StateAccess, online_only, validate_state_location
+from .errors import DriveError, is_runtime_error, is_transient_source_error
+from .fs_access import SourceAccess, StateAccess, online_only, validate_state_location, private_io_path
 from .state_pool import JOB_HISTORY_LIMIT, StateLease, pool_settings
 from . import diagnostics as operational
 from .contextual import select_context, plan as evidence_plan
@@ -46,6 +46,7 @@ MAX_SEGMENT_BYTES = 49152
 MAX_CURSOR_CHARS = 1024
 MAX_QUERY_CHARS = 500
 MAX_PREFIX_CHARS = 1024
+EXTRACTION_CACHE_SCHEMA = 5  # Bump for persistence, segmentation or parser dependency behavior changes.
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 LATIN_RE = re.compile(r"[a-z0-9]+")
 
@@ -121,9 +122,11 @@ class Engine:
         self._query_lock = threading.RLock()
         max_slots = pool_settings(config)
         parser_signature = hashlib.sha256(Path(__file__).with_name("extract.py").read_bytes()).hexdigest()
-        indexer_signature = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("fs_access.py").read_bytes()
-                                           + Path(__file__).with_name("network_source.py").read_bytes()).hexdigest()
-        self._parse_binding = hashlib.sha256(_json({"parser": parser_signature, "indexer": indexer_signature, "limits": self.limits, "aliases": self.aliases, "schema": 4}).encode()).hexdigest()
+        # Query, broker and source-access implementation changes do not alter
+        # extracted content. Bump storage_schema when persistence/segmentation
+        # semantics change; extractor changes always require fresh extraction.
+        self._parse_binding = hashlib.sha256(_json({"parser": parser_signature, "limits": self.limits,
+                                                   "storage_schema": EXTRACTION_CACHE_SCHEMA}).encode()).hexdigest()
         raw_state = Path(config["state_dir"] if state_override is None else state_override).expanduser()
         raw_state = raw_state if raw_state.is_absolute() else config_file.parent / raw_state
         validate_state_location(raw_state)
@@ -194,6 +197,7 @@ class Engine:
         self._secret = secrets.token_bytes(32)
         self._session = threading.local()
         self._fatal_error = None
+        self._runtime_error = None
         self._stop = threading.Event()
         self._scan_lock = threading.RLock()
         self._job_lock = threading.Lock()
@@ -234,7 +238,8 @@ class Engine:
         if autostart:
             self._thread = threading.Thread(target=self._run, name="team-drive-index", daemon=True)
             self._thread.start()
-            self.refresh()
+            if self._runtime_error is None:
+                self.refresh()
 
     @contextlib.contextmanager
     def _db(self):
@@ -294,17 +299,23 @@ class Engine:
                 db.execute("ALTER TABLE files ADD COLUMN content_coverage TEXT NOT NULL DEFAULT '{}'")
             if "origin" not in columns:
                 db.execute("ALTER TABLE files ADD COLUMN origin TEXT NOT NULL DEFAULT '{}'")
+            if "needs_reparse" not in columns:
+                db.execute("ALTER TABLE files ADD COLUMN needs_reparse INTEGER NOT NULL DEFAULT 0")
+            if "indexed_parse_binding" not in columns:
+                db.execute("ALTER TABLE files ADD COLUMN indexed_parse_binding TEXT")
             WikiStore.init_schema(db)
             root_binding = db.execute("SELECT value FROM meta WHERE key='root_binding'").fetchone()
             if root_binding and root_binding[0] != self._root_binding:
                 raise DriveError("STATE_ROOT_MISMATCH", "This state directory belongs to a different source root.", False, "Choose a new empty state directory for the new source root.")
             db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('root_binding',?)", (self._root_binding,))
             old_binding = db.execute("SELECT value FROM meta WHERE key='parse_binding'").fetchone()
+            db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('parse_generation','1')")
             if old_binding and old_binding[0] != self._parse_binding:
-                db.execute("UPDATE files SET status='pending',source_version=NULL,segments_count=0,format_warnings='[]' WHERE status!='deleted'")
-                db.execute("DELETE FROM segments")
-                db.execute("DELETE FROM structure")
-                db.execute("DELETE FROM search_index")
+                # Keep published candidates, but do not serve old extraction
+                # as current evidence. Each successful reparse replaces one
+                # file atomically; unrelated queries cannot erase this cache.
+                db.execute("UPDATE files SET needs_reparse=1,indexed_parse_binding=COALESCE(indexed_parse_binding,?) WHERE status IN ('ready','failed')", (old_binding[0],))
+                db.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='parse_generation'")
                 self._bump(db)
             db.execute("INSERT INTO meta(key,value) VALUES('parse_binding',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self._parse_binding,))
             db.execute("UPDATE jobs SET status='interrupted',finished_at=? WHERE status IN ('queued','running')", (time.time(),))
@@ -314,6 +325,9 @@ class Engine:
             operational.prune(db, self.diagnostic_settings)
             self.retrieval.init_schema(db)
             self.retrieval.prune(db)
+            latest = db.execute("SELECT status,error_code FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            if latest and latest["status"] == "failed" and is_runtime_error(latest["error_code"]):
+                self._runtime_error = {"code": latest["error_code"], "message": "The previous scan stopped after a local runtime failure."}
 
     @staticmethod
     def _prune_jobs(db):
@@ -335,11 +349,15 @@ class Engine:
         present = sum(n for s, n in counts.items() if s != "deleted")
         inventory = db.execute("SELECT value FROM meta WHERE key='inventory_complete'").fetchone()[0] == "true"
         partial = db.execute("SELECT COUNT(*) FROM files WHERE status='ready' AND extraction_complete=0").fetchone()[0]
+        pending_reparse = db.execute("SELECT COUNT(*) FROM files WHERE status IN ('ready','failed') AND needs_reparse=1").fetchone()[0]
+        current_ready = db.execute("SELECT COUNT(*) FROM files WHERE status='ready' AND needs_reparse=0").fetchone()[0]
         return {"inventory_complete": inventory, "present_files": present,
                 "indexed_files": counts.get("ready", 0), "states": counts,
-                "all_present_files_indexed": inventory and present == counts.get("ready", 0),
+                "current_indexed_files": current_ready, "pending_reparse": pending_reparse,
+                "parse_generation": int(db.execute("SELECT value FROM meta WHERE key='parse_generation'").fetchone()[0]),
+                "all_present_files_indexed": inventory and present == current_ready,
                 "partial_files": partial,
-                "all_present_files_extracted_completely": inventory and present == counts.get("ready", 0) and partial == 0,
+                "all_present_files_extracted_completely": inventory and present == current_ready and partial == 0,
                 "scope": "Configured remote folder; current access and version checked before returning cached candidates or evidence." if self._remote_source else "Configured local root; content freshness is revalidated before evidence reads.",
                 "business_completeness": "not_established",
                 "scan_resume": ResumableScan.status(db, self._share_binding and getattr(self._source, "resumable", False))}
@@ -350,7 +368,10 @@ class Engine:
                 "source_version": row["source_version"], "status": row["status"],
                 "segments_count": row["segments_count"],
                 "format_warnings": json.loads(row["format_warnings"]),
-                "extraction_complete": row["status"] == "ready" and bool(row["extraction_complete"]),
+                "extraction_complete": row["status"] == "ready" and not row["needs_reparse"] and bool(row["extraction_complete"]),
+                "pending_reparse": bool(row["needs_reparse"]),
+                "extraction_current": row["status"] == "ready" and not row["needs_reparse"],
+                "indexed_parse_binding": row["indexed_parse_binding"],
                 "content_coverage": json.loads(row["content_coverage"]),
                 "origin": json.loads(row["origin"]),
                 "error": ({"code": row["error_code"], "message": row["error_message"]}
@@ -365,6 +386,8 @@ class Engine:
             try:
                 self._source.verify_origin(item["path"], item.get("origin", {}), deadline=deadline)
             except DriveError as exc:
+                if is_transient_source_error(exc):
+                    raise  # Failed verification returns no evidence; timeout is not a source change.
                 with self._db() as db:
                     db.execute("UPDATE meta SET value='false' WHERE key='inventory_complete'")
                 if self._share_binding or exc.code in ("GRAPH_SOURCE_CHANGED", "GRAPH_SCOPE_CHANGED", "GRAPH_ACCESS_DENIED", "GRAPH_ITEM_UNAVAILABLE"):
@@ -459,7 +482,9 @@ class Engine:
                     "source_id": self._root_binding,
                     "cloud_source": self._cloud_binding,
                     "shared_source": self._share_binding,
-                    "indexer_health": "healthy" if self._thread is not None else "manual",
+                    "indexer_health": ("blocked" if self._runtime_error else
+                                       "healthy" if self._thread is not None and self._thread.is_alive() else "manual"),
+                    "runtime_error": self._runtime_error,
                     "current_job_id": self._pending_job,
                     "search_mode": "keyword_with_aliases_and_bm25",
                     "retrieval": self.retrieval.status(db),
@@ -486,14 +511,18 @@ class Engine:
         with self._job_lock:
             if self._pending_job:
                 return {"ok": True, "job_id": self._pending_job, "status": "already_queued_or_running", "force_applied": False}
+            if self._runtime_error is not None and not force:
+                raise DriveError("INDEX_RUNTIME_BLOCKED", "The previous scan stopped after a local runtime failure.", False,
+                                 "Repair the reported runtime error, then explicitly refresh with force=true.")
             job_id = uuid.uuid4().hex
             with self._db() as db:
                 db.execute("INSERT INTO jobs(id,status,created_at) VALUES(?,'queued',?)", (job_id, time.time()))
             self._pending_job = job_id
             if force:
                 self._force_jobs.add(job_id)
+                self._runtime_error = None
             self._queue.put(job_id)
-            return {"ok": True, "job_id": job_id, "status": "queued"}
+            return {"ok": True, "job_id": job_id, "status": "queued", "force_applied": force}
 
     def job_status(self, job_id=None):
         with self._db() as db:
@@ -517,12 +546,18 @@ class Engine:
         coverage = self._coverage(db)
         latest = db.execute("SELECT status,error_code FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
         latest_status = latest["status"] if latest else None
-        if latest_status in ("queued", "running"):
+        if self._runtime_error is not None:
+            state = "blocked"
+        elif latest_status in ("queued", "running"):
             state = "scanning"
         elif latest_status == "partial":
             state = "partial"
         elif latest_status in ("failed", "interrupted", "cancelled"):
             state = "failed" if latest_status != "cancelled" else "cancelled"
+        elif coverage["pending_reparse"]:
+            state = "updating"
+        elif coverage["inventory_complete"] and coverage["present_files"] and not coverage["current_indexed_files"]:
+            state = "blocked"
         elif coverage["inventory_complete"]:
             state = "ready" if coverage["all_present_files_extracted_completely"] else "partial"
         else:
@@ -530,6 +565,9 @@ class Engine:
         return {"state": state, "inventory_complete": coverage["inventory_complete"],
                 "latest_job_status": latest_status, "latest_error_code": latest["error_code"] if latest else None,
                 "indexed_files": coverage["indexed_files"],
+                "queryable": coverage["current_indexed_files"] > 0 and self._runtime_error is None,
+                "runtime_error": self._runtime_error,
+                "failed_files": coverage["states"].get("failed", 0),
                 "meaning": "Service availability is separate from inventory completion and evidence coverage."}
 
     def _require_share_inventory(self, db):
@@ -554,7 +592,7 @@ class Engine:
                 try:
                     job_id = self._queue.get(timeout=self.poll_seconds)
                 except queue.Empty:
-                    if not self._stop.is_set():
+                    if not self._stop.is_set() and self._runtime_error is None:
                         try:
                             self.refresh()
                         except DriveError as exc:
@@ -571,7 +609,7 @@ class Engine:
                         code = exc.code if isinstance(exc, DriveError) else "SCAN_FAILED"
                         db.execute("UPDATE jobs SET status='failed',error_code=?,finished_at=? WHERE id=?", (code, time.time(), job_id))
                         self._prune_jobs(db)
-                    if isinstance(exc, sqlite3.Error) or (isinstance(exc, DriveError) and exc.code.startswith("STATE_")):
+                    if isinstance(exc, sqlite3.Error):
                         raise
                 finally:
                     with self._job_lock:
@@ -704,7 +742,7 @@ class Engine:
             current = db.execute("SELECT path,source_version,status FROM files WHERE id=?", (file_id,)).fetchone()
             if current is None or (expected_version is not None and current["source_version"] != expected_version):
                 return
-            db.execute("UPDATE files SET status=?,error_code=?,error_message=?,segments_count=0,updated_at=? WHERE id=?", (status, code, message, time.time(), file_id))
+            db.execute("UPDATE files SET status=?,error_code=?,error_message=?,segments_count=0,needs_reparse=0,updated_at=? WHERE id=?", (status, code, message, time.time(), file_id))
             db.execute("DELETE FROM segments WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
             db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
@@ -721,11 +759,16 @@ class Engine:
             raise DriveError("FILE_NOT_FOUND", "The file is not present in this index.", True, "Refresh or select a file from list/search.")
         if expected_version is not None and expected_version != row["source_version"]:
             raise DriveError("VERSION_MISMATCH", "The expected source version does not match the indexed version.", True, "Inspect the current source and restart the operation.")
+        if row["needs_reparse"]:
+            raise DriveError("EXTRACTION_UPDATE_REQUIRED", "The cached extraction was produced by an older parser revision.", True,
+                             "Resume indexing and wait for this file to be reparsed before reading or exporting evidence.")
         if row["status"] != "ready":
             raise DriveError(row["error_code"] or "FILE_NOT_READY", row["error_message"] or "The file has not been completely indexed.", True, "Check status, refresh if appropriate, and resolve the stated limitation.")
         try:
             version, _ = self._digest(row["path"])
         except DriveError as exc:
+            if self._remote_source and is_transient_source_error(exc):
+                raise
             if self._remote_source and exc.code.startswith(("GRAPH_", "AUTH_", "SHARE_")):
                 # Preserve the last parsed snapshot for recovery, but never serve it
                 # as verified evidence when cloud access/version checks fail.
@@ -1229,6 +1272,11 @@ class Engine:
         # Keep the completed inventory and its final telemetry/checkpoint in
         # one scan boundary, including for concurrent synchronous callers.
         with self._scan_lock:
+            if self._runtime_error is not None:
+                if not force and job_id not in self._force_jobs:
+                    raise DriveError("INDEX_RUNTIME_BLOCKED", "Repair the runtime before restarting the scan.", False,
+                                     "Repair the reported error, then explicitly refresh with force=true.")
+                self._runtime_error = None
             return self._scan_tracked(job_id, force)
 
     def _scan_tracked(self, job_id, force):
@@ -1253,6 +1301,10 @@ class Engine:
         except Exception as exc:
             progress.finish("failed")
             detail = error_detail(exc, progress)
+            if is_runtime_error(exc):
+                self._runtime_error = {"code": exc.code, "message": exc.message}
+                if isinstance(exc.__cause__, DriveError):
+                    self._runtime_error["primary_error_code"] = exc.__cause__.code
             with self._db() as db:
                 db.execute("UPDATE jobs SET status='failed',error_code=?,finished_at=?,scan_progress=?,error_detail=? WHERE id=?",
                            (detail["code"], time.time(), _json(progress.snapshot()), _json(detail), job_id))
@@ -1317,7 +1369,7 @@ class Engine:
             last_path = ""
             while complete and job_id not in self._cancelled and not self._stop.is_set():
                 with self._db() as db:
-                    row = db.execute("SELECT * FROM files WHERE status='pending' AND path>? ORDER BY path LIMIT 1", (last_path,)).fetchone()
+                    row = db.execute("SELECT * FROM files WHERE (status='pending' OR (status IN ('ready','failed') AND needs_reparse=1)) AND path>? ORDER BY path LIMIT 1", (last_path,)).fetchone()
                 if row is None:
                     break
                 last_path = row["path"]
@@ -1346,7 +1398,7 @@ class Engine:
         # later scans resume from persistent segment digests.
         deadline = time.monotonic() + 20
         with self._db() as db:
-            pending_vectors = db.execute("SELECT * FROM files WHERE status='ready' ORDER BY path").fetchall()
+            pending_vectors = db.execute("SELECT * FROM files WHERE status='ready' AND needs_reparse=0 ORDER BY path").fetchall()
         for vector_file in pending_vectors:
             if time.monotonic() >= deadline or self._stop.is_set() or job_id in self._cancelled:
                 break
@@ -1390,7 +1442,7 @@ class Engine:
                 db.execute("DELETE FROM structure WHERE file_id=?", (file_id,))
                 db.execute("DELETE FROM search_index WHERE file_id=?", (file_id,))
                 self.retrieval.delete_file(db, file_id)
-                db.execute("UPDATE files SET origin=? WHERE id=?", (
+                db.execute("UPDATE files SET needs_reparse=0,indexed_parse_binding=NULL,origin=? WHERE id=?", (
                     _json(self._source.evidence(relative)) if self._remote_source else "{}", file_id))
                 db.execute("INSERT INTO search_index(tokens,file_id,ordinal) VALUES(?,?,-1)", (" ".join(tokenize(relative)), file_id))
                 self._bump(db)
@@ -1398,17 +1450,37 @@ class Engine:
     def _parse_file(self, row):
         started = time.perf_counter()
         name = "job-temp-" + uuid.uuid4().hex
+        parse_error = None
         try:
             with self._storage.directory(name, create=True) as work_dir:
                 self._parse_file_guarded(row, work_dir)
             self._storage.remove_empty_directory(name)
         except DriveError as exc:
+            parse_error = exc.code
+            if is_transient_source_error(exc):
+                # A timeout does not invalidate a published extraction. Keep
+                # pending/reparse rows retryable and let the scan's existing
+                # partial/recovery handling record the bounded interruption.
+                cleanup_error = getattr(exc, "cleanup_error", None)
+                if is_runtime_error(cleanup_error):
+                    parse_error = cleanup_error.code
+                    raise cleanup_error from exc
+                raise
+            if is_runtime_error(exc):
+                with self._db() as db:
+                    state = db.execute("SELECT status FROM files WHERE id=?", (row["id"],)).fetchone()
+                if state is not None and state["status"] != "ready":
+                    self._invalidate(row["id"], exc.code, exc.message, "pending")
+                raise
             self._parse_failure(row["id"], exc.code, exc.message)
+            cleanup_error = getattr(exc, "cleanup_error", None)
+            if is_runtime_error(cleanup_error):
+                raise cleanup_error from exc
         finally:
             with self._db() as db:
-                state = db.execute("SELECT status,error_code FROM files WHERE id=?", (row["id"],)).fetchone()
-            self._record_operation("parse", started, {"ok": bool(state and state["status"] == "ready"),
-                                   "error": {"code": state["error_code"] if state else "FILE_NOT_FOUND"}})
+                state = db.execute("SELECT status,error_code,needs_reparse FROM files WHERE id=?", (row["id"],)).fetchone()
+            self._record_operation("parse", started, {"ok": bool(state and state["status"] == "ready" and not state["needs_reparse"] and parse_error is None),
+                                   "error": {"code": parse_error or (state["error_code"] if state else "FILE_NOT_FOUND")}})
 
     def _parse_failure(self, file_id, code, message):
         if self._stop.is_set():
@@ -1419,6 +1491,7 @@ class Engine:
     def _parse_file_guarded(self, row, work_dir):
         snapshot_path = None
         parsed_path = None
+        primary_error = None
         try:
             snapshot_path = work_dir / ("snapshot-" + uuid.uuid4().hex + row["suffix"])
             with self._storage.new_private(snapshot_path, binary=True) as snapshot:
@@ -1449,6 +1522,7 @@ class Engine:
                     db.execute("INSERT INTO structure VALUES(?,?,?,?,?)", (row["id"], group_position, group_key, group_start, group_end))
                 complete = not content_coverage.get("missing_text_pages")
                 db.execute("UPDATE files SET source_version=?,status='ready',error_code=NULL,error_message=NULL,segments_count=?,size=?,mtime_ns=?,ctime_ns=?,format_warnings=?,extraction_complete=?,content_coverage=?,updated_at=? WHERE id=?", (version, count, current_info.st_size, current_info.st_mtime_ns, self._inventory_time(current_info), _json(warnings), int(complete), _json(content_coverage), time.time(), row["id"]))
+                db.execute("UPDATE files SET needs_reparse=0,indexed_parse_binding=? WHERE id=?", (self._parse_binding, row["id"]))
                 if self._remote_source:
                     origin = self._source.evidence(row["path"])
                     if origin.get("source_version") != version:
@@ -1456,14 +1530,31 @@ class Engine:
                     db.execute("UPDATE files SET origin=? WHERE id=?", (_json(origin), row["id"]))
                 self._bump(db)
         except DriveError as exc:
-            self._parse_failure(row["id"], exc.code, exc.message)
-        except Exception:
-            self._parse_failure(row["id"], "PARSE_FAILED", "The file could not be parsed safely.")
+            primary_error = exc
+            raise
+        except sqlite3.Error as exc:
+            primary_error = exc
+            raise
+        except Exception as exc:
+            primary_error = DriveError("PARSE_FAILED", "The file could not be parsed safely.")
+            raise primary_error from exc
         finally:
-            if snapshot_path:
-                self._storage.unlink_private(snapshot_path)
-            if parsed_path:
-                self._storage.unlink_private(parsed_path)
+            cleanup_error = None
+            for path in (snapshot_path, parsed_path):
+                if path is not None:
+                    try:
+                        self._storage.unlink_private(path)
+                    except (DriveError, OSError) as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc if isinstance(exc, DriveError) else DriveError(
+                                "STATE_IO_ERROR", "A private parser file could not be cleaned up.")
+                        self._record_operation("parser_cleanup", time.perf_counter(),
+                                               {"ok": False, "error": {"code": cleanup_error.code}})
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                if isinstance(primary_error, DriveError):
+                    primary_error.cleanup_error = cleanup_error
 
     @staticmethod
     def _structure_group(locator):
@@ -1480,12 +1571,17 @@ class Engine:
 
     def _extract(self, snapshot_path, parsed_path):
         environment = os.environ.copy()
-        environment.update({"TMPDIR": str(snapshot_path.parent), "TMP": str(snapshot_path.parent), "TEMP": str(snapshot_path.parent), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"})
+        temp_path = private_io_path(snapshot_path.parent)
+        environment.update({"TMPDIR": temp_path, "TMP": temp_path, "TEMP": temp_path, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"})
         package_parent = str(Path(__file__).resolve().parent.parent)
         inherited_pythonpath = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = package_parent + (os.pathsep + inherited_pythonpath if inherited_pythonpath else "")
-        process = subprocess.Popen([sys.executable, "-m", "team_drive.extract", str(snapshot_path), _json(self.limits)],
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+        try:
+            process = subprocess.Popen([sys.executable, "-m", "team_drive.extract", private_io_path(snapshot_path), _json(self.limits)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment)
+        except OSError as exc:
+            raise DriveError("RUNTIME_PARSER_START_FAILED", "The configured parser process could not start.", False,
+                             "Check the saved interpreter and local runtime, then explicitly retry the failed scan.") from exc
         with self._process_lock:
             self._active_process = process
         timed_out = threading.Event()

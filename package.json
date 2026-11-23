@@ -1,6 +1,6 @@
 {
   "name": "df-mcp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Local-first, evidence-aware team document reader with MCP tools and an agent skill",
   "private": true,
   "type": "module",
